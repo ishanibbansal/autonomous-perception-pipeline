@@ -1,0 +1,31 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Pycache
+__pycache__/
+*.py[cod]
+
+# Waymo Data Files (CRITICAL)
+data/
+*.tfrecord
+*.parquet
+*.mcap
+*.db3
+*.bag
+
+# Model Checkpoints
+models/
+*.pth
+*.pt
+*.onnx
+*.weights
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
+
+# VS Code Settings
+.vscode/
