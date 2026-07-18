@@ -29,3 +29,7 @@ models/
 
 # VS Code Settings
 .vscode/
+
+# Output files and Cache
+outputs/
+__pycache__/
