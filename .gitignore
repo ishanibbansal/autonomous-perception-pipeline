@@ -33,3 +33,6 @@ models/
 # Output files and Cache
 outputs/
 __pycache__/
+
+# Models
+*.pt
