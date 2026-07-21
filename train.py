@@ -1,59 +1,83 @@
 import torch
 import torch.optim as optim
+from torch.utils.data import DataLoader
+
 from model import Waymo3DDetector
 from loss import Waymo3DLoss
+from utils.dataset import WaymoDataset
+from utils.target_encoder import TargetEncoder
 
-def train_single_batch():
-    print("Initializing Model and Loss...")
-    # 1. Instantiate the architecture and multi-task loss function
-    model = Waymo3DDetector()
+def train_model():
+    # Setup GPU device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Initializing Training on: {device}")
+
+    # 1. Instantiate Architecture, Loss, and Encoder
+    model = Waymo3DDetector().to(device)
     criterion = Waymo3DLoss()
+    encoder = TargetEncoder()
     
-    # 2. Set up the Optimizer
-    # We use Adam with a standard learning rate (1e-3) for rapid, stable convergence
+    # 2. Set up Optimizer
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    # 3. Create the Dummy Data (The Single Batch)
-    print("Generating single-batch data for the overfitting test...")
-    dummy_input = torch.randn(1, 3, 1280, 1920)
+    # 3. Load the Real Waymo Data
+    print("Loading Waymo .tfrecord Dataset...")
+    tfrecord_file = 'data/raw/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
+    dataset = WaymoDataset(tfrecord_path=tfrecord_file)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
     
-    # Ground truth targets must perfectly match the grid shape of the outputs (40x60)
-    dummy_targets = {
-        'class': torch.rand(1, 3, 40, 60),
-        'location': torch.randn(1, 3, 40, 60),
-        'dimensions': torch.randn(1, 3, 40, 60),
-        'orientation': torch.randn(1, 2, 40, 60)
-    }
-    
-    # 4. The Overfitting Loop
+    # 4. Training Loop Variables
     epochs = 50
-    print(f"\nStarting {epochs}-epoch single-batch overfitting run...\n")
+    checkpoint_path = "waymo_3d_checkpoint.pt"
     
-    model.train() # Set the model to training mode
+    print(f"\nStarting {epochs}-epoch training run...\n")
+    model.train() 
     
     for epoch in range(epochs):
-        # A. Zero out the gradients from the previous iteration
-        optimizer.zero_grad()
+        epoch_loss = 0.0
         
-        # B. Forward Pass: Push the image through the network
-        predictions = model(dummy_input)
+        for batch_idx, batch in enumerate(dataloader):
+            # Extract inputs and raw targets
+            images = batch['front_image'].to(device, dtype=torch.float32)
+            raw_bboxes = batch['bboxes']
+            valid_boxes = batch['num_valid_boxes']
+            
+            # Encode raw bounding boxes into dense spatial grids
+            encoded_targets = encoder.encode(raw_bboxes, valid_boxes)
+            
+            # Move encoded targets to the GPU
+            targets = {k: v.to(device) for k, v in encoded_targets.items()}
+            
+            # Zero out gradients
+            optimizer.zero_grad()
+            
+            # Forward Pass
+            predictions = model(images)
+            
+            # Calculate Loss
+            loss, loss_components = criterion(predictions, targets)
+            
+            # Backward Pass & Optimize
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            
+            # Console Logging for Batches
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch + 1:02d}/{epochs} | Batch {batch_idx} | Total Loss: {loss.item():.4f}")
         
-        # C. Calculate the multi-task loss
-        loss, loss_components = criterion(predictions, dummy_targets)
-        
-        # D. Backward Pass: Calculate the gradients 
-        loss.backward()
-        
-        # E. Update the network's weights based on the gradients
-        optimizer.step()
-        
-        # F. Console Logging
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch + 1:02d}/{epochs} | Total Loss: {loss.item():.4f} | "
-                  f"Cls: {loss_components['cls_loss']:.4f}, "
-                  f"Loc: {loss_components['loc_loss']:.4f}, "
-                  f"Dim: {loss_components['dim_loss']:.4f}, "
-                  f"Ori: {loss_components['orient_loss']:.4f}")
+        # 5. Checkpointing
+        # Save a checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': epoch_loss,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            print(f"--> Saved checkpoint at epoch {epoch + 1} to {checkpoint_path}")
 
 if __name__ == '__main__':
-    train_single_batch()
+    train_model()
