@@ -58,16 +58,20 @@ def train_model():
             
             epoch_train_loss += loss.item()
             
+            # ---> BATCH LOGGING: Print an update every 10 batches <---
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch + 1:02d}/{epochs} | Batch {batch_idx:03d} | Loss: {loss.item():.4f}")
+                
         # Calculate average training loss for the epoch
         avg_train_loss = epoch_train_loss / len(train_dataloader)
         
         # 5. Validation Loop
-        avg_val_loss = validate_model(model, val_dataloader, criterion, encoder, device)
+        avg_val_loss, avg_map = validate_model(model, val_dataloader, criterion, encoder, device)
         
-        # Epoch Logging
-        print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        # 6. Epoch Logging (Cleaned up duplicates)
+        print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val mAP: {avg_map:.4f}")
         
-        # 6. Checkpointing
+        # 7. Checkpointing
         if (epoch + 1) % 5 == 0:
             checkpoint = {
                 'epoch': epoch + 1,
@@ -75,6 +79,7 @@ def train_model():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
+                'val_map': avg_map,
             }
             torch.save(checkpoint, checkpoint_path)
             print(f"--> Saved checkpoint at epoch {epoch + 1} to {checkpoint_path}")
