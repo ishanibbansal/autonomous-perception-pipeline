@@ -30,7 +30,7 @@ def train_model():
     train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     
     val_dataset = WaymoDataset(tfrecord_path=val_file)
-    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False) # No need to shuffle validation data
+    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     
     # 4. Training Loop Variables
     epochs = 50
@@ -39,7 +39,7 @@ def train_model():
     print(f"\nStarting {epochs}-epoch training run...\n")
     
     for epoch in range(epochs):
-        model.train() # Set to train mode at the start of every epoch
+        model.train() 
         epoch_train_loss = 0.0
         
         for batch_idx, batch in enumerate(train_dataloader):
@@ -68,7 +68,7 @@ def train_model():
         # 5. Validation Loop
         avg_val_loss, avg_map = validate_model(model, val_dataloader, criterion, encoder, device)
         
-        # 6. Epoch Logging (Cleaned up duplicates)
+        # 6. Epoch Logging 
         print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val mAP: {avg_map:.4f}")
         
         # 7. Checkpointing
