@@ -23,7 +23,12 @@ To replicate this environment, both the host and client must be authenticated on
    - Connect via VS Code Remote-SSH.
 
 ## Data Pipeline (Sprint 1)
-*Documentation coming soon...*
+
+The pipeline ingests raw `.tfrecord` files from the Waymo Open Dataset and prepares them for monocular 3D spatial regression. 
+
+* **Monocular 3D Labels:** The custom machine learning dataset class explicitly captures 3D bounding box target labels (`[X, Y, Z, Length, Width, Height, Heading]`) to properly train the network on physical depth and volume metrics.
+* **Sensor Fusion & Geometric Projection:** To reconcile mismatched human-annotated IDs across sensors, the pipeline uses a pinhole camera model (`focal_length = 2000.0`, `camera_height = 1.5m`) to mathematically project 3D LiDAR geometry onto the 2D front camera plane. A forward-FOV filter dynamically drops any labels physically located behind the ego-vehicle.
+* **Spatial Grid Encoding:** Bounding boxes are processed into a 10D tensor. The 2D image pixels are used to map vehicles to a discrete 40x60 spatial grid, while the raw, un-normalized 3D meters are preserved and assigned to the grid cells as physical regression targets for the loss function.
 
 ## Model Training (Sprint 2)
 *Documentation coming soon...*

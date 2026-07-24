@@ -16,8 +16,8 @@ class TargetEncoder:
     def encode(self, bboxes, num_valid_boxes):
         """
         Args:
-            bboxes: Tensor of shape [Batch, Max_Boxes, 8]
-                    8 dims -> [Class, X, Y, Z, Length, Width, Height, Heading]
+            bboxes: Tensor of shape [Batch, Max_Boxes, 10]
+                    10 dims -> [Class, Pix_X, Pix_Y, 3D_X, 3D_Y, 3D_Z, Length, Width, Height, Heading]
             num_valid_boxes: Tensor of shape [Batch] indicating how many boxes are real
         Returns:
             Dictionary of target tensors matching the model's output shapes.
@@ -30,8 +30,7 @@ class TargetEncoder:
         target_dim = torch.zeros((batch_size, 3, self.grid_h, self.grid_w))
         target_ori = torch.zeros((batch_size, 2, self.grid_h, self.grid_w))
         
-        # We also need a mask to tell the loss function which cells actually contain 
-        # objects so we don't penalize the regression heads for empty background cells.
+        # Mask to tell the loss function which cells actually contain objects
         mask = torch.zeros((batch_size, 1, self.grid_h, self.grid_w))
         
         for b in range(batch_size):
@@ -41,14 +40,15 @@ class TargetEncoder:
                 box = bboxes[b, i]
                 cls_id = int(box[0].item()) - 1  # Shift 1-based class ID to 0-based index
                 
-                # Extract coordinates
-                cx, cy, cz = box[1].item(), box[2].item(), box[3].item()
-                length, width, height = box[4].item(), box[5].item(), box[6].item()
-                heading = box[7].item()
+                # Extract coordinates from the new 10D tensor
+                pixel_x, pixel_y = box[1].item(), box[2].item()
+                cx, cy, cz = box[3].item(), box[4].item(), box[5].item()
+                length, width, height = box[6].item(), box[7].item(), box[8].item()
+                heading = box[9].item()
                 
-                # 1. Map continuous image coordinates to discrete grid indices
-                grid_x = int(cx / self.stride_x)
-                grid_y = int(cy / self.stride_y)
+                # 1. Map continuous image PIXELS to discrete grid indices
+                grid_x = int(pixel_x / self.stride_x)
+                grid_y = int(pixel_y / self.stride_y)
                 
                 # Ensure the projected center falls within our 40x60 grid and valid classes
                 if 0 <= grid_x < self.grid_w and 0 <= grid_y < self.grid_h and 0 <= cls_id < 3:
@@ -59,10 +59,9 @@ class TargetEncoder:
                     # 2. Classification: Set probability to 1.0 for the correct class layer
                     target_cls[b, cls_id, grid_y, grid_x] = 1.0
                     
-                    # 3. Location: Calculate the offset from the top-left of the grid cell
-                    # This allows the network to predict sub-grid pixel accuracy
-                    target_loc[b, 0, grid_y, grid_x] = (cx / self.stride_x) - grid_x
-                    target_loc[b, 1, grid_y, grid_x] = (cy / self.stride_y) - grid_y
+                    # 3. Location: Assign the raw 3D meters directly
+                    target_loc[b, 0, grid_y, grid_x] = cx
+                    target_loc[b, 1, grid_y, grid_x] = cy
                     target_loc[b, 2, grid_y, grid_x] = cz
                     
                     # 4. Dimensions: Assign raw metric scale
@@ -71,7 +70,6 @@ class TargetEncoder:
                     target_dim[b, 2, grid_y, grid_x] = height
                     
                     # 5. Orientation: Convert heading angle (radians) to Sine/Cosine pairs
-                    # This avoids the "wrap-around" discontinuity at Pi and -Pi
                     target_ori[b, 0, grid_y, grid_x] = math.sin(heading)
                     target_ori[b, 1, grid_y, grid_x] = math.cos(heading)
                     

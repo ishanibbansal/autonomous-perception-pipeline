@@ -10,7 +10,7 @@ from waymo_open_dataset import dataset_pb2 as open_dataset
 class WaymoDataset(Dataset):
     def __init__(self, tfrecord_path, max_boxes=100):
         self.tfrecord_path = tfrecord_path
-        self.max_boxes = max_boxes # The maximum number of labels we allow per frame
+        self.max_boxes = max_boxes 
         self.raw_dataset = tf.data.TFRecordDataset(self.tfrecord_path, compression_type='')
         
         print("Initializing dataset and counting frames...")
@@ -33,45 +33,65 @@ class WaymoDataset(Dataset):
                 front_image_tensor = torch.from_numpy(decoded_img).permute(2, 0, 1)
                 break 
                 
-        # 2. Extract 3D Bounding Boxes (LiDAR Labels)
-        # Shape: [max_boxes, 8] -> [Class, X, Y, Z, Length, Width, Height, Heading]
-        bboxes = np.zeros((self.max_boxes, 8), dtype=np.float32)
+        # 2. Extract 3D Bounding Boxes and Project geometrically to 2D
+        bboxes = np.zeros((self.max_boxes, 10), dtype=np.float32)
+        valid_idx = 0
         
-        num_valid_boxes = min(len(frame.laser_labels), self.max_boxes)
+        # Waymo Front Camera Approximations (Pinhole Model)
+        IMAGE_WIDTH = 1920
+        IMAGE_HEIGHT = 1280
+        FOCAL_LENGTH = 2000.0  
+        CAMERA_HEIGHT_OFFSET = 1.5 # The camera is mounted ~1.5m above the vehicle origin
         
-        for i in range(num_valid_boxes):
-            label = frame.laser_labels[i]
+        for label in frame.laser_labels:
+            if valid_idx >= self.max_boxes:
+                break
+                
+            x = label.box.center_x # Depth (Forward)
+            y = label.box.center_y # Horizontal (Left)
+            z = label.box.center_z # Vertical (Up)
             
-            bboxes[i, 0] = label.type  # e.g., 1 for Vehicle, 2 for Pedestrian
-            bboxes[i, 1] = label.box.center_x
-            bboxes[i, 2] = label.box.center_y
-            bboxes[i, 3] = label.box.center_z
-            bboxes[i, 4] = label.box.length
-            bboxes[i, 5] = label.box.width
-            bboxes[i, 6] = label.box.height
-            bboxes[i, 7] = label.box.heading
+            # Step 1: Physical FOV Filter 
+            # Only keep objects in front of the vehicle (X > 2 meters)
+            # and roughly within the horizontal field of view
+            if x > 2.0 and abs(y / x) < 0.6: 
+                
+                # Step 2: Geometric Projection
+                # Convert vehicle frame (X=forward, Y=left, Z=up) to image pixels
+                pixel_x = (IMAGE_WIDTH / 2) - (FOCAL_LENGTH * y / x)
+                pixel_y = (IMAGE_HEIGHT / 2) - (FOCAL_LENGTH * (z - CAMERA_HEIGHT_OFFSET) / x)
+                
+                # Step 3: Validate the projection lands inside the 1920x1280 image frame
+                if 0 <= pixel_x < IMAGE_WIDTH and 0 <= pixel_y < IMAGE_HEIGHT:
+                    bboxes[valid_idx, 0] = label.type  
+                    bboxes[valid_idx, 1] = pixel_x
+                    bboxes[valid_idx, 2] = pixel_y
+                    bboxes[valid_idx, 3] = x
+                    bboxes[valid_idx, 4] = y
+                    bboxes[valid_idx, 5] = z
+                    bboxes[valid_idx, 6] = label.box.length
+                    bboxes[valid_idx, 7] = label.box.width
+                    bboxes[valid_idx, 8] = label.box.height
+                    bboxes[valid_idx, 9] = label.box.heading
+                    
+                    valid_idx += 1
 
         return {
             'timestamp': torch.tensor(frame.timestamp_micros, dtype=torch.int64),
             'front_image': front_image_tensor,
             'bboxes': torch.from_numpy(bboxes),
-            'num_valid_boxes': torch.tensor(num_valid_boxes, dtype=torch.int32)
+            'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32)
         }
 
 # --- Testing the Class ---
 if __name__ == '__main__':
     data_path = 'data/raw/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
-    
     waymo_data = WaymoDataset(data_path)
     dataloader = DataLoader(waymo_data, batch_size=4, shuffle=False)
     
     for batch in dataloader:
         print("\n--- Batch Extracted ---")
         print(f"Front Image Batch Shape: {batch['front_image'].shape}")
-        
-        # Check the new bounding box shapes
-        bbox_shape = batch['bboxes'].shape
-        print(f"Bounding Box Batch Shape: {bbox_shape}")
-        print(f"Dimensions: [Batch_Size, Max_Boxes, Box_Attributes (Class + 7D Coords)]")
-        print(f"Valid boxes per frame in this batch: {batch['num_valid_boxes'].tolist()}")
+        print(f"Bounding Box Batch Shape: {batch['bboxes'].shape}")
+        print(f"Valid visible boxes per frame: {batch['num_valid_boxes'].tolist()}")
         break
