@@ -36,3 +36,13 @@ This file serves as a living technical journal for the project. It tracks active
 * **Symptom:** Attempting to filter visible vehicles by cross-referencing Waymo's `camera_labels` IDs with `laser_labels` IDs resulted in `0` intersecting boxes.
 * **Root Cause:** 1) Waymo assigns completely separate, non-matching string IDs for human-annotated 2D images and 3D LiDAR (for vehicles). 2) LiDAR scans a 360-degree radius. Iterating purely through `laser_labels` was feeding the neural network 3D coordinates for vehicles located *behind* the ego-vehicle's front camera.
 * **Solution:** Bypassed the dataset's human tracking IDs and implemented mathematical sensor fusion. Utilized a pinhole camera model (`focal_length = 2000.0`, `camera_height = 1.5m`) to geometrically project the physical 3D LiDAR coordinates directly onto the 2D image plane `(u, v)`. Applied a strict forward-FOV filter (`X > 2.0`) to immediately exclude non-visible geometry.
+
+---
+
+## 👁️ Perception Training & Inference Logs (Sprint 2)
+
+### Log 2.1: Training Plateau and Duplicate Bounding Box Clustering
+* **Date:** July 25, 2026
+* **Symptom:** After completing a training run using the frozen YOLOv8 backbone and custom `Head3D`, validation mAP remained critically low and validation loss plateaued around `30 to 37` while training loss steadily descended.
+* **Root Cause:** 1) Missing or un-tuned Non-Max Suppression (NMS) during post-processing, allowing multiple adjacent grid cells and anchor priors to independently fire positive predictions for the same object. 2) The "Frozen Backbone Wall": YOLOv8's backbone was pre-trained entirely on 2D COCO objects, which contain zero metric depth, orientation, or 3D bounding box information. A completely frozen feature extractor made it mathematically impossible for the custom head to extract true spatial depth features.
+* **Solution:** Completed task `#17 Build the Inference Pipeline` (`predict.py`) and implemented NMS clustering. Unfroze the tail of the YOLOv8 backbone (layers 5–9) while keeping early feature layers (0–4) frozen, and introduced differential learning rates (`1e-5` for the backbone, `1e-3` for the `Head3D`) to allow proper geometric adaptation without destroying pre-trained edge weights. Added gradient norm clipping (`max_norm=5.0`) and best-checkpoint tracking to secure peak validation performance.

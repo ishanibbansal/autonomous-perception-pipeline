@@ -5,9 +5,10 @@ env/
 venv/
 ENV/
 
-# Pycache
+# Pycache & OS files
 __pycache__/
 *.py[cod]
+.DS_Store
 
 # Waymo Data Files (CRITICAL)
 data/
@@ -17,22 +18,24 @@ data/
 *.db3
 *.bag
 
-# Model Checkpoints
+# Model Checkpoints & Weights
 models/
 *.pth
 *.pt
 *.onnx
 *.weights
 
+# Logs & Training Outputs
+*.log
+outputs/
+
+# Image Files & Visualizations
+*.jpg
+*.jpeg
+*.png
+
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints
 
 # VS Code Settings
 .vscode/
-
-# Output files and Cache
-outputs/
-__pycache__/
-
-# Models
-*.pt

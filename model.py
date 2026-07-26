@@ -20,7 +20,7 @@ class Head3D(nn.Module):
         # Branch 1: Object Classification (num_classes logits)
         self.cls_head = nn.Conv2d(128, num_classes, kernel_size=1)
         
-        # Branch 2: 3D Center Location (X, Y, Z depth offset in meters)
+        # Branch 2: 3D Center Location (X offset, Y offset, Z depth in meters)
         self.loc_head = nn.Conv2d(128, 3, kernel_size=1)
         
         # Branch 3: 3D Box Dimensions (Length, Width, Height)
@@ -32,10 +32,18 @@ class Head3D(nn.Module):
     def forward(self, x):
         feat = self.conv_shared(x)
         
-        cls_preds = self.cls_head(feat)       # Shape: [B, num_classes, 40, 60]
-        loc_preds = self.loc_head(feat)       # Shape: [B, 3, 40, 60]
-        dim_preds = self.dim_head(feat)       # Shape: [B, 3, 40, 60]
-        orient_preds = self.orient_head(feat) # Shape: [B, 2, 40, 60]
+        cls_preds = self.cls_head(feat)       # Shape: [B, num_classes, H, W]
+        
+        # Constrain X, Y grid offsets to [0, 1) using Sigmoid to match TargetEncoder,
+        # while keeping absolute depth (index 2, cx) unconstrained.
+        raw_loc = self.loc_head(feat)
+        loc_preds = torch.cat([
+            torch.sigmoid(raw_loc[:, 0:2, :, :]), # offset_x, offset_y
+            raw_loc[:, 2:3, :, :]                 # absolute depth (cx)
+        ], dim=1)                                 # Shape: [B, 3, H, W]
+        
+        dim_preds = self.dim_head(feat)       # Shape: [B, 3, H, W]
+        orient_preds = self.orient_head(feat) # Shape: [B, 2, H, W]
         
         return {
             'class': cls_preds,
@@ -49,13 +57,20 @@ class Waymo3DDetector(nn.Module):
         super().__init__()
         print(f"Loading pre-trained {yolo_version} backbone...")
         
-        # 1. Load YOLO model & isolate backbone (Layers 0-9)
+        # 1. Load YOLO model & isolate backbone children modules (Layers 0-9)
         base_yolo = YOLO(yolo_version)
-        self.backbone = nn.Sequential(*list(base_yolo.model.model.children())[:10])
+        self.backbone_modules = list(base_yolo.model.model.children())[:10]
+        self.backbone = nn.Sequential(*self.backbone_modules)
         
-        # 2. Freeze backbone weights for initial training transfer
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        # 2. Partial Backbone Unfreezing:
+        # Freeze early layers (0-4) to retain low-level edge and corner features.
+        # Unfreeze later layers (5-9) so they can adapt to geometric scale and depth cues.
+        for idx, module in enumerate(self.backbone):
+            for param in module.parameters():
+                if idx <= 4:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
             
         # 3. Attach Custom 3D Detection Head
         self.head3d = Head3D(in_channels=256, num_classes=num_classes)
@@ -67,7 +82,7 @@ class Waymo3DDetector(nn.Module):
 
 if __name__ == '__main__':
     model = Waymo3DDetector()
-    dummy_input = torch.randn(1, 3, 1280, 1920)
+    dummy_input = torch.randn(1, 3, 640, 960)
     
     print("\nExecuting forward pass with custom 3D heads...")
     outputs = model(dummy_input)
