@@ -1,12 +1,12 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-import torch
+import struct
 import random
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+import torch
+from torch.utils.data import Dataset
 import tensorflow as tf
 from waymo_open_dataset import dataset_pb2 as open_dataset
+from waymo_open_dataset.utils import frame_utils
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
@@ -14,122 +14,171 @@ class WaymoDataset(Dataset):
     def __init__(self, tfrecord_path, max_boxes=100):
         self.tfrecord_path = tfrecord_path
         self.max_boxes = max_boxes 
-        self.raw_dataset = tf.data.TFRecordDataset(self.tfrecord_path, compression_type='')
         
-        print(f"Initializing dataset and counting frames for {os.path.basename(tfrecord_path)}...")
-        self.frame_list = [data.numpy() for data in self.raw_dataset]
-        self.num_frames = len(self.frame_list)
+        # Prevent TensorFlow from allocating GPU VRAM inside PyTorch workers
+        tf.config.set_visible_devices([], 'GPU')
+        
+        # Build a lightweight byte-offset index for fast seeking without RAM bloat
+        self.record_offsets = self._index_tfrecord(self.tfrecord_path)
+        self.num_frames = len(self.record_offsets)
+
+    def _index_tfrecord(self, file_path):
+        """
+        Fast binary scanner to map byte locations of each record.
+        Uses ~0 MB of RAM regardless of dataset size.
+        """
+        offsets = []
+        with open(file_path, 'rb') as f:
+            while True:
+                offset = f.tell()
+                header = f.read(8)
+                if not header or len(header) < 8:
+                    break
+                length = struct.unpack('<Q', header)[0]
+                data_offset = offset + 12
+                offsets.append((data_offset, length))
+                # Skip to the start of the next record (header 8 + crc 4 + data length + crc 4 = 16 + length)
+                f.seek(offset + 16 + length)
+        return offsets
 
     def __len__(self):
         return self.num_frames
+        
+    def _extract_top_lidar_points(self, frame):
+        # 1. Parse range images
+        (range_images, camera_projections, 
+         seg_labels, range_image_top_pose) = frame_utils.parse_range_image_and_camera_projection(frame)
+        
+        top_laser = open_dataset.LaserName.TOP
+        
+        # 2. CPU OPTIMIZATION TRICK: Remove non-TOP calibrations from the frame.
+        # This forces the C++ Waymo utility to completely skip the heavy 
+        # trigonometric math for the side, front, and rear lasers.
+        calibrations = [c for c in frame.context.laser_calibrations if c.name == top_laser]
+        del frame.context.laser_calibrations[:]
+        frame.context.laser_calibrations.extend(calibrations)
+        
+        # 3. Safely run the point cloud conversion (it will now only process TOP)
+        points, _ = frame_utils.convert_range_image_to_point_cloud(
+            frame,
+            range_images,
+            camera_projections,
+            range_image_top_pose
+        )
+        
+        # FIX: Because we stripped the metadata down to 1 laser, 
+        # the 'points' list now only contains exactly 1 element at index 0.
+        point_cloud = points[0]
+        
+        # Filter points in front of ego-vehicle (X > 0)
+        front_fov_mask = point_cloud[:, 0] > 0.0
+        filtered_points = point_cloud[front_fov_mask]
+        
+        return torch.tensor(filtered_points, dtype=torch.float32)
+
+    def _project_to_depth_map(self, lidar_points):
+        IMAGE_WIDTH = 960
+        IMAGE_HEIGHT = 640
+        FOCAL_LENGTH = 1000.0
+        CAMERA_HEIGHT_OFFSET = 1.5 
+        
+        x = lidar_points[:, 0]
+        y = lidar_points[:, 1]
+        z = lidar_points[:, 2]
+        
+        u = (IMAGE_WIDTH / 2) - (FOCAL_LENGTH * y / x)
+        v = (IMAGE_HEIGHT / 2) - (FOCAL_LENGTH * (z - CAMERA_HEIGHT_OFFSET) / x)
+        
+        u = torch.round(u).long()
+        v = torch.round(v).long()
+        
+        valid_mask = (u >= 0) & (u < IMAGE_WIDTH) & (v >= 0) & (v < IMAGE_HEIGHT)
+        
+        u_valid = u[valid_mask]
+        v_valid = v[valid_mask]
+        depth_valid = x[valid_mask] 
+        
+        depth_map = torch.zeros((1, IMAGE_HEIGHT, IMAGE_WIDTH), dtype=torch.float32)
+        
+        sorted_indices = torch.argsort(depth_valid, descending=True)
+        u_sorted = u_valid[sorted_indices]
+        v_sorted = v_valid[sorted_indices]
+        depth_sorted = depth_valid[sorted_indices]
+        
+        depth_map[0, v_sorted, u_sorted] = depth_sorted
+        
+        return depth_map
 
     def __getitem__(self, idx):
-        raw_data = self.frame_list[idx]
+        # Seek directly to the byte location in the file
+        data_offset, data_len = self.record_offsets[idx]
+        with open(self.tfrecord_path, 'rb') as f:
+            f.seek(data_offset)
+            raw_data = f.read(data_len)
+            
         frame = open_dataset.Frame()
-        frame.ParseFromString(bytearray(raw_data))
+        frame.ParseFromString(raw_data)
         
-        # 1. Extract Front Camera Image
+        # 1. RGB Extraction
         front_image_tensor = None
         for camera_image in frame.images:
             if camera_image.name == open_dataset.CameraName.FRONT:
                 decoded_img = tf.io.decode_jpeg(camera_image.image).numpy()
                 front_image_tensor = torch.from_numpy(decoded_img).permute(2, 0, 1)
-                
-                # ---> DOWNSCALE IMAGE 50% <---
                 front_image_tensor = TF.resize(front_image_tensor, [640, 960], antialias=True)
                 break 
                 
-        # ---> FIXED AUGMENTATION BLOCK <---
-        is_train = 'train' in self.tfrecord_path
-        do_hflip = is_train and random.random() > 0.5
-        
-        if is_train:
-            # Safely normalize to [0.0, 1.0] for PyTorch vision transforms
-            front_image_tensor = front_image_tensor.float() / 255.0
-            
-            # Apply a milder ColorJitter to prevent artifacting
-            jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
-            
-            # Randomly apply the jitter 50% of the time to maintain clean baseline data
-            if random.random() > 0.5:
-                front_image_tensor = jitter(front_image_tensor)
-                
-            # Scale back to [0.0, 255.0] to match model's expected input
-            front_image_tensor = front_image_tensor * 255.0
-            
-        if do_hflip:
-            # Spatial: Flip the image tensor horizontally
-            front_image_tensor = TF.hflip(front_image_tensor)
-        # ----------------------------------
-                
-        # 2. Extract 3D Bounding Boxes and Project geometrically to 2D
+        # 2. Bounding Box Extraction
         bboxes = np.zeros((self.max_boxes, 10), dtype=np.float32)
         valid_idx = 0
-        
-        # ---> SCALED CAMERA INTRINSICS (50%) <---
-        IMAGE_WIDTH = 960.0
-        IMAGE_HEIGHT = 640.0
-        FOCAL_LENGTH = 1000.0
-        CAMERA_HEIGHT_OFFSET = 1.5 
+        IMAGE_WIDTH, IMAGE_HEIGHT = 960.0, 640.0
+        FOCAL_LENGTH, CAMERA_HEIGHT_OFFSET = 1000.0, 1.5 
         
         for label in frame.laser_labels:
             if valid_idx >= self.max_boxes:
                 break
                 
-            x = label.box.center_x # Depth (Forward)
-            y = label.box.center_y # Horizontal (Left)
-            z = label.box.center_z # Vertical (Up)
+            x, y, z = label.box.center_x, label.box.center_y, label.box.center_z
             heading = label.box.heading
             
-            # ---> APPLY SPATIAL FLIP TO 3D TARGETS <---
-            if do_hflip:
-                y = -y
-                heading = -heading
-            # ------------------------------------------
-            
-            # Step 1: Physical FOV Filter 
             if x > 2.0 and abs(y / x) < 0.6: 
-                
-                # Step 2: Geometric Projection
                 pixel_x = (IMAGE_WIDTH / 2) - (FOCAL_LENGTH * y / x)
                 pixel_y = (IMAGE_HEIGHT / 2) - (FOCAL_LENGTH * (z - CAMERA_HEIGHT_OFFSET) / x)
                 
-                # Step 3: Validate the projection lands inside the 960x640 image frame
                 if 0 <= pixel_x < IMAGE_WIDTH and 0 <= pixel_y < IMAGE_HEIGHT:
-                    bboxes[valid_idx, 0] = label.type  
-                    bboxes[valid_idx, 1] = pixel_x
-                    bboxes[valid_idx, 2] = pixel_y
-                    bboxes[valid_idx, 3] = x
-                    bboxes[valid_idx, 4] = y
-                    bboxes[valid_idx, 5] = z
-                    bboxes[valid_idx, 6] = label.box.length
-                    bboxes[valid_idx, 7] = label.box.width
-                    bboxes[valid_idx, 8] = label.box.height
-                    bboxes[valid_idx, 9] = heading  
-                    
+                    bboxes[valid_idx] = [
+                        label.type, pixel_x, pixel_y, x, y, z,
+                        label.box.length, label.box.width, label.box.height, heading
+                    ]
                     valid_idx += 1
+
+        # 3. Optimized TOP LiDAR Extraction & Depth Projection
+        lidar_points = self._extract_top_lidar_points(frame)
+        depth_map = self._project_to_depth_map(lidar_points)
+        
+        # 4. Augmentation
+        is_train = 'train' in self.tfrecord_path
+        if is_train:
+            front_image_tensor = front_image_tensor.float() / 255.0
+            jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+            if random.random() > 0.5:
+                front_image_tensor = jitter(front_image_tensor)
+            front_image_tensor = front_image_tensor * 255.0
+            
+            if random.random() > 0.5:
+                front_image_tensor = TF.hflip(front_image_tensor)
+                depth_map = TF.hflip(depth_map)
+                for i in range(valid_idx):
+                    bboxes[i, 4] = -bboxes[i, 4] 
+                    bboxes[i, 9] = -bboxes[i, 9] 
+                    bboxes[i, 1] = 960.0 - bboxes[i, 1]
+
+        rgbd_image_tensor = torch.cat((front_image_tensor, depth_map), dim=0)
 
         return {
             'timestamp': torch.tensor(frame.timestamp_micros, dtype=torch.int64),
-            'front_image': front_image_tensor,
+            'front_image': rgbd_image_tensor,
             'bboxes': torch.from_numpy(bboxes),
-            'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32)
+            'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32),
+            'lidar_points': lidar_points
         }
-
-if __name__ == '__main__':
-    data_path = 'data/raw/train/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
-    if not os.path.exists(data_path):
-        import glob
-        train_files = glob.glob('data/raw/train/*.tfrecord')
-        if train_files:
-            data_path = train_files[0]
-            
-    waymo_data = WaymoDataset(data_path)
-    dataloader = DataLoader(waymo_data, batch_size=4, shuffle=False)
-    
-    for batch in dataloader:
-        print("\n--- Batch Extracted ---")
-        print(f"Front Image Batch Shape: {batch['front_image'].shape}")
-        print(f"Bounding Box Batch Shape: {batch['bboxes'].shape}")
-        print(f"Valid visible boxes per frame: {batch['num_valid_boxes'].tolist()}")
-        break

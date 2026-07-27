@@ -3,6 +3,7 @@ import glob
 import time
 import torch
 import torch.optim as optim
+import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, ConcatDataset
 
 from model import Waymo3DDetector
@@ -17,22 +18,29 @@ def freeze_batchnorm(module):
     if classname.find('BatchNorm') != -1:
         module.eval()
 
+def custom_collate_fn(batch):
+    return {
+        'timestamp': torch.stack([item['timestamp'] for item in batch]),
+        'front_image': torch.stack([item['front_image'] for item in batch]),
+        'bboxes': torch.stack([item['bboxes'] for item in batch]),
+        'num_valid_boxes': torch.stack([item['num_valid_boxes'] for item in batch]),
+        'lidar_points': [item['lidar_points'] for item in batch]
+    }
+
 def train_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Initializing Training on: {device}")
     
-    # Enable CuDNN benchmark for fixed image size optimization
     torch.backends.cudnn.benchmark = True
 
     model = Waymo3DDetector().to(device)
-    criterion = Waymo3DLoss()
+    criterion = Waymo3DLoss().to(device)
     encoder = TargetEncoder(image_width=960, image_height=640, grid_w=30, grid_h=20)
     
-
-    # Differential learning rates: protecting the backbone features while training the head
     optimizer = optim.AdamW([
         {'params': model.backbone.parameters(), 'lr': 1e-5},
-        {'params': model.head3d.parameters(), 'lr': 1e-3}
+        {'params': model.head3d.parameters(), 'lr': 1e-3},
+        {'params': criterion.parameters(), 'lr': 1e-3}
     ], weight_decay=1e-4)
     
     print("Loading Waymo .tfrecord Datasets...")
@@ -58,12 +66,33 @@ def train_model():
     print(f"Found {len(train_files)} training segments.")
     train_datasets = [WaymoDataset(tfrecord_path=f) for f in train_files]
     train_dataset = ConcatDataset(train_datasets)
-    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0, pin_memory=True)
+    
+    # Conservatively set num_workers=2 to prevent WSL memory thrashing
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=4, 
+        shuffle=True, 
+        num_workers=2,               
+        pin_memory=True, 
+        collate_fn=custom_collate_fn,
+        persistent_workers=True,     
+        prefetch_factor=2            
+    )
     
     print(f"Found {len(val_files)} validation segments.")
     val_datasets = [WaymoDataset(tfrecord_path=f) for f in val_files]
     val_dataset = ConcatDataset(val_datasets)
-    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
+    
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=4, 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=True, 
+        collate_fn=custom_collate_fn,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
     
     print(f"Total training frames pooled: {len(train_dataset)}")
     print(f"Total validation frames pooled: {len(val_dataset)}")
@@ -71,8 +100,6 @@ def train_model():
     checkpoint_path = "waymo_3d_checkpoint.pt"
     best_checkpoint_path = "best_waymo_3d_checkpoint.pt"
     best_val_map = 0.0
-    
-    # Set how often to validate (e.g., every 2 epochs)
     VAL_INTERVAL = 2 
     
     print(f"\nStarting {epochs}-epoch training run...\n")
@@ -80,9 +107,9 @@ def train_model():
     for epoch in range(epochs):
         model.train() 
         model.apply(freeze_batchnorm) 
-        epoch_train_loss = 0.0
+        criterion.train()
         
-        # Start the timer for the first batch
+        epoch_train_loss = 0.0
         batch_start_time = time.time()
         
         for batch_idx, batch in enumerate(train_dataloader):
@@ -93,7 +120,6 @@ def train_model():
             encoded_targets = encoder.encode(raw_bboxes, valid_boxes)
             targets = {k: v.to(device) for k, v in encoded_targets.items()}
             
-            # Vehicle Filter
             original_mask = targets['mask'].bool()
             vehicle_class_mask = (targets['class'][:, 0, :, :] == 1).unsqueeze(1)
             targets['mask'] = original_mask & vehicle_class_mask
@@ -103,32 +129,23 @@ def train_model():
             loss, _ = criterion(predictions, targets)
             loss.backward()
             
-            # Clip gradients to prevent exploding loss / NaN corruption
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            
             optimizer.step()
             
             epoch_train_loss += loss.item()
             
-            # Print stats every 10 batches
             if batch_idx % 10 == 0:
-                # Calculate time elapsed
                 elapsed_time = time.time() - batch_start_time
                 batches_processed = 1 if batch_idx == 0 else 10
                 sec_per_batch = elapsed_time / batches_processed
                 
                 print(f"Epoch {epoch + 1:02d}/{epochs} | Batch {batch_idx:03d} | Loss: {loss.item():.4f} | Speed: {sec_per_batch:.3f} sec/batch")
-                
-                # Reset the timer for the next 10 batches
                 batch_start_time = time.time()
                 
         avg_train_loss = epoch_train_loss / len(train_dataloader)
         
-        # --- NEW VALIDATION LOGIC ---
-        # Only run validation every VAL_INTERVAL epochs, or on the very last epoch
         if (epoch + 1) % VAL_INTERVAL == 0 or (epoch + 1) == epochs or QUICK_DEBUG_RUN:
-            
-            # Raised conf_thresh to 0.25 to speed up NMS processing
+            criterion.eval()
             avg_val_loss, avg_map = validate_model(model, val_dataloader, criterion, encoder, device, conf_thresh=0.25)
             
             print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val mAP: {avg_map:.4f}")
@@ -142,20 +159,18 @@ def train_model():
                 'val_map': avg_map,
             }
             
-            # Save periodic checkpoint
             if (epoch + 1) % 5 == 0 or QUICK_DEBUG_RUN:
                 torch.save(checkpoint, checkpoint_path)
                 print(f"--> Saved periodic checkpoint at epoch {epoch + 1} to {checkpoint_path}")
                 
-            # Save best checkpoint if mAP improves
             if avg_map > best_val_map:
                 best_val_map = avg_map
                 torch.save(checkpoint, best_checkpoint_path)
                 print(f"--> [NEW BEST] Saved peak model with Val mAP: {avg_map:.4f} to {best_checkpoint_path}")
                 
         else:
-            # On skipped epochs, just print the training loss
             print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Validation Skipped (Speed Up)")
 
 if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
     train_model()
