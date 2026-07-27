@@ -62,7 +62,6 @@ def draw_3d_wireframe(img, x, y, z, l, w, h, heading, color=(0, 255, 0), thickne
 
 def predict_single_frame(image_path, checkpoint_path='best_waymo_3d_checkpoint.pt', output_path='prediction_output.jpg'):
     print(f"Loading model from {checkpoint_path} onto CPU...")
-    # Explicitly force CPU execution to protect active GPU training VRAM
     device = torch.device('cpu')
     
     model = Waymo3DDetector() 
@@ -87,10 +86,7 @@ def predict_single_frame(image_path, checkpoint_path='best_waymo_3d_checkpoint.p
         print(f"Error: Could not read image at {image_path}")
         return
         
-    # Convert OpenCV BGR to PyTorch RGB format
     img_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
-    
-    # Convert to tensor and resize to match training configuration
     img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() 
     img_tensor = TF.resize(img_tensor, [640, 960], antialias=True)
     img_tensor = img_tensor.unsqueeze(0).to(device)
@@ -99,15 +95,13 @@ def predict_single_frame(image_path, checkpoint_path='best_waymo_3d_checkpoint.p
     with torch.no_grad():
         predictions = model(img_tensor)
         
-    # Evaluate confidence scores
     class_probs = torch.sigmoid(predictions['class'][0])
-    print(f"DEBUG -> The highest raw confidence score in this image is: {class_probs.max().item():.3f}")
+    print(f"DEBUG -> The absolute peak CenterNet score is: {class_probs.max().item():.3f}")
     
     decoded_boxes = decode_predictions(predictions, conf_thresh=0.08)[0] 
     
     print(f"\n--- Found {len(decoded_boxes)} vehicles ---")
     
-    # Create the drawing canvas
     draw_img = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
     draw_img = cv2.cvtColor(draw_img, cv2.COLOR_RGB2BGR)
     

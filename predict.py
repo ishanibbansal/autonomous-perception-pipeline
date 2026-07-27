@@ -86,10 +86,8 @@ def predict_single_frame(image_path, checkpoint_path, output_path='prediction_ou
         print(f"Error: Could not read image at {image_path}")
         return
         
-    # Convert OpenCV BGR to PyTorch RGB format
     img_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
     
-    # Convert to tensor but DO NOT divide by 255.0 to match training data
     img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() 
     img_tensor = TF.resize(img_tensor, [640, 960], antialias=True)
     img_tensor = img_tensor.unsqueeze(0).to(device)
@@ -98,17 +96,13 @@ def predict_single_frame(image_path, checkpoint_path, output_path='prediction_ou
     with torch.no_grad():
         predictions = model(img_tensor)
         
-    # --- DEBUGGING ---
-    # Find the absolute highest confidence score anywhere on the feature map
     class_probs = torch.sigmoid(predictions['class'][0])
-    print(f"DEBUG -> The highest raw confidence score in this image is: {class_probs.max().item():.3f}")
+    print(f"DEBUG -> The absolute peak CenterNet score is: {class_probs.max().item():.3f}")
     
-    # Drop the threshold to 8% (0.08) to let the network's timid guesses through
     decoded_boxes = decode_predictions(predictions, conf_thresh=0.08)[0] 
     
     print(f"\n--- Found {len(decoded_boxes)} vehicles ---")
     
-    # Create the drawing canvas (convert RGB tensor directly back to BGR for OpenCV)
     draw_img = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
     draw_img = cv2.cvtColor(draw_img, cv2.COLOR_RGB2BGR)
     

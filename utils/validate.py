@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from utils.metrics import calculate_map
 
 def apply_nms(boxes, distance_threshold=1.5):
@@ -9,7 +10,6 @@ def apply_nms(boxes, distance_threshold=1.5):
     if len(boxes) == 0:
         return boxes
         
-    # Sort boxes by confidence score descending
     scores = boxes[:, 0]
     sorted_indices = torch.argsort(scores, descending=True)
     boxes = boxes[sorted_indices]
@@ -23,20 +23,27 @@ def apply_nms(boxes, distance_threshold=1.5):
         current = boxes[0]
         rest = boxes[1:]
         
-        # Calculate Euclidean distance in BEV (X, Y) to suppress redundant overlapping cells
         dists = torch.sqrt((rest[:, 1] - current[1])**2 + (rest[:, 2] - current[2])**2)
-        
-        # Keep boxes that are further apart than the distance threshold
         overlap_mask = dists > distance_threshold
         boxes = rest[overlap_mask]
         
     return torch.stack(keep) if keep else torch.zeros((0, 8), device=boxes.device)
 
 
-def decode_predictions(preds, conf_thresh=0.1):
+def _extract_peaks(heatmap, kernel=3):
     """
-    Scans the dense output grid and extracts boxes with high confidence.
-    Converts relative grid offsets and depth back into absolute 3D world coordinates.
+    Applies a 3x3 max pooling operation to a CenterNet heatmap to extract local maxima.
+    """
+    pad = (kernel - 1) // 2
+    hmax = F.max_pool2d(heatmap, kernel_size=kernel, stride=1, padding=pad)
+    keep = (hmax == heatmap).float()
+    return heatmap * keep
+
+
+def decode_predictions(preds, conf_thresh=0.1, max_depth=80.0, num_depth_bins=40):
+    """
+    Extracts object peaks from the CenterNet heatmap and decodes bin-based depth
+    back into absolute 3D world coordinates.
     Returns a list of tensors of shape [N, 8] -> [Conf, X, Y, Z, L, W, H, Heading]
     """
     IMAGE_WIDTH = 960.0
@@ -44,20 +51,29 @@ def decode_predictions(preds, conf_thresh=0.1):
     FOCAL_LENGTH = 1000.0
     CAMERA_HEIGHT_OFFSET = 1.5
     STRIDE = 32.0 
+    BIN_SIZE = max_depth / num_depth_bins
 
-    keys = list(preds.keys())
-    cls_key = next(k for k in keys if 'class' in k.lower() or 'cls' in k.lower())
-    loc_key = next(k for k in keys if 'loc' in k.lower())
-    dim_key = next(k for k in keys if 'dim' in k.lower())
-    ori_key = next(k for k in keys if 'ori' in k.lower() or 'orientation' in k.lower())
+    # Extract all prediction heads
+    cls_preds = preds['class']
+    loc_preds = preds['location']
+    depth_bin_preds = preds['depth_bin']
+    depth_res_preds = preds['depth_res']
+    dim_preds = preds['dimensions']
+    ori_preds = preds['orientation']
     
-    batch_size = preds[cls_key].shape[0]
-    cls_probs = torch.sigmoid(preds[cls_key])  
+    batch_size = cls_preds.shape[0]
+    
+    # Apply Sigmoid and extract CenterNet spatial peaks
+    cls_probs = torch.sigmoid(cls_preds)  
+    cls_probs = _extract_peaks(cls_probs)
+    
+    # Get highest probability depth bin for each cell
+    depth_bin_indices = torch.argmax(depth_bin_preds, dim=1) # Shape: [B, H, W]
     
     batch_boxes = []
     
     for b in range(batch_size):
-        vehicle_probs = cls_probs[b][0] 
+        vehicle_probs = cls_probs[b][0] # Index 0 for vehicle class
         mask = vehicle_probs > conf_thresh
         conf = vehicle_probs[mask]
         
@@ -65,30 +81,31 @@ def decode_predictions(preds, conf_thresh=0.1):
             batch_boxes.append(torch.zeros((0, 8), device=conf.device))
             continue
             
-        # Get the grid cell indices [Y, X] for valid detections
         y_indices, x_indices = torch.where(mask)
         
-        loc = preds[loc_key][b][:, y_indices, x_indices] # Shape: [3, N]
-        dim = preds[dim_key][b][:, y_indices, x_indices] # Shape: [3, N]
-        ori = preds[ori_key][b][:, y_indices, x_indices] # Shape: [2, N]
+        # 1. Extract 2D Offsets
+        offset_x = loc_preds[b, 0, y_indices, x_indices]
+        offset_y = loc_preds[b, 1, y_indices, x_indices]
         
-        # 1. Extract Offsets and Depth
-        offset_x = loc[0, :]
-        offset_y = loc[1, :]
-        cx = loc[2, :] # Forward depth
+        # 2. Decode Bin-Based Depth
+        bin_idx = depth_bin_indices[b, y_indices, x_indices].float()
+        residual = depth_res_preds[b, 0, y_indices, x_indices]
+        cx = (bin_idx + residual) * BIN_SIZE
         
-        # 2. Reconstruct 2D Pixels
+        # 3. Reconstruct 2D Pixels
         pixel_x = (x_indices.float() + offset_x) * STRIDE
         pixel_y = (y_indices.float() + offset_y) * STRIDE
         
-        # 3. Project back to absolute 3D World Coordinates
+        # 4. Project back to absolute 3D World Coordinates
         cy = ((IMAGE_WIDTH / 2.0) - pixel_x) * cx / FOCAL_LENGTH
         cz = ((IMAGE_HEIGHT / 2.0) - pixel_y) * cx / FOCAL_LENGTH + CAMERA_HEIGHT_OFFSET
         
-        # Stack absolute coordinates back into standard format
         abs_loc = torch.stack([cx, cy, cz], dim=0)
         
-        # Convert Heading
+        # 5. Extract Dimensions and Orientation
+        dim = dim_preds[b, :, y_indices, x_indices]
+        ori = ori_preds[b, :, y_indices, x_indices]
+        
         sin_val = ori[0, :]
         cos_val = ori[1, :]
         heading = torch.atan2(sin_val, cos_val).unsqueeze(0) 
@@ -96,9 +113,7 @@ def decode_predictions(preds, conf_thresh=0.1):
         # Concatenate into [N, 8]
         boxes = torch.cat([conf.unsqueeze(1), abs_loc.t(), dim.t(), heading.t()], dim=1)
         
-        # Apply NMS to clean up overlapping duplicate clusters
         boxes = apply_nms(boxes, distance_threshold=1.5)
-        
         batch_boxes.append(boxes)
         
     return batch_boxes

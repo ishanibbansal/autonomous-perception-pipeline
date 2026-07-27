@@ -39,28 +39,37 @@ class WaymoDataset(Dataset):
                 front_image_tensor = TF.resize(front_image_tensor, [640, 960], antialias=True)
                 break 
                 
-        # ---> AUGMENTATION BLOCK <---
+        # ---> FIXED AUGMENTATION BLOCK <---
         is_train = 'train' in self.tfrecord_path
         do_hflip = is_train and random.random() > 0.5
         
         if is_train:
-            # Photometric: Randomize lighting, contrast, and saturation
-            jitter = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1)
-            front_image_tensor = jitter(front_image_tensor)
+            # Safely normalize to [0.0, 1.0] for PyTorch vision transforms
+            front_image_tensor = front_image_tensor.float() / 255.0
+            
+            # Apply a milder ColorJitter to prevent artifacting
+            jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+            
+            # Randomly apply the jitter 50% of the time to maintain clean baseline data
+            if random.random() > 0.5:
+                front_image_tensor = jitter(front_image_tensor)
+                
+            # Scale back to [0.0, 255.0] to match model's expected input
+            front_image_tensor = front_image_tensor * 255.0
             
         if do_hflip:
             # Spatial: Flip the image tensor horizontally
             front_image_tensor = TF.hflip(front_image_tensor)
-        # ----------------------------
+        # ----------------------------------
                 
         # 2. Extract 3D Bounding Boxes and Project geometrically to 2D
         bboxes = np.zeros((self.max_boxes, 10), dtype=np.float32)
         valid_idx = 0
         
         # ---> SCALED CAMERA INTRINSICS (50%) <---
-        IMAGE_WIDTH = 960.0    # Was 1920
-        IMAGE_HEIGHT = 640.0   # Was 1280
-        FOCAL_LENGTH = 1000.0  # Was 2000.0
+        IMAGE_WIDTH = 960.0
+        IMAGE_HEIGHT = 640.0
+        FOCAL_LENGTH = 1000.0
         CAMERA_HEIGHT_OFFSET = 1.5 
         
         for label in frame.laser_labels:
@@ -107,10 +116,8 @@ class WaymoDataset(Dataset):
             'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32)
         }
 
-# --- Testing the Class ---
 if __name__ == '__main__':
     data_path = 'data/raw/train/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
-    # Fallback in case testing file doesn't exist at the new nested path
     if not os.path.exists(data_path):
         import glob
         train_files = glob.glob('data/raw/train/*.tfrecord')
