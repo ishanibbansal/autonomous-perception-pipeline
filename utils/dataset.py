@@ -2,18 +2,21 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 import torch
+import random
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import tensorflow as tf
 from waymo_open_dataset import dataset_pb2 as open_dataset
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 class WaymoDataset(Dataset):
     def __init__(self, tfrecord_path, max_boxes=100):
         self.tfrecord_path = tfrecord_path
-        self.max_boxes = max_boxes # The maximum number of labels we allow per frame
+        self.max_boxes = max_boxes 
         self.raw_dataset = tf.data.TFRecordDataset(self.tfrecord_path, compression_type='')
         
-        print("Initializing dataset and counting frames...")
+        print(f"Initializing dataset and counting frames for {os.path.basename(tfrecord_path)}...")
         self.frame_list = [data.numpy() for data in self.raw_dataset]
         self.num_frames = len(self.frame_list)
 
@@ -31,47 +34,102 @@ class WaymoDataset(Dataset):
             if camera_image.name == open_dataset.CameraName.FRONT:
                 decoded_img = tf.io.decode_jpeg(camera_image.image).numpy()
                 front_image_tensor = torch.from_numpy(decoded_img).permute(2, 0, 1)
+                
+                # ---> DOWNSCALE IMAGE 50% <---
+                front_image_tensor = TF.resize(front_image_tensor, [640, 960], antialias=True)
                 break 
                 
-        # 2. Extract 3D Bounding Boxes (LiDAR Labels)
-        # Shape: [max_boxes, 8] -> [Class, X, Y, Z, Length, Width, Height, Heading]
-        bboxes = np.zeros((self.max_boxes, 8), dtype=np.float32)
+        # ---> FIXED AUGMENTATION BLOCK <---
+        is_train = 'train' in self.tfrecord_path
+        do_hflip = is_train and random.random() > 0.5
         
-        num_valid_boxes = min(len(frame.laser_labels), self.max_boxes)
-        
-        for i in range(num_valid_boxes):
-            label = frame.laser_labels[i]
+        if is_train:
+            # Safely normalize to [0.0, 1.0] for PyTorch vision transforms
+            front_image_tensor = front_image_tensor.float() / 255.0
             
-            bboxes[i, 0] = label.type  # e.g., 1 for Vehicle, 2 for Pedestrian
-            bboxes[i, 1] = label.box.center_x
-            bboxes[i, 2] = label.box.center_y
-            bboxes[i, 3] = label.box.center_z
-            bboxes[i, 4] = label.box.length
-            bboxes[i, 5] = label.box.width
-            bboxes[i, 6] = label.box.height
-            bboxes[i, 7] = label.box.heading
+            # Apply a milder ColorJitter to prevent artifacting
+            jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+            
+            # Randomly apply the jitter 50% of the time to maintain clean baseline data
+            if random.random() > 0.5:
+                front_image_tensor = jitter(front_image_tensor)
+                
+            # Scale back to [0.0, 255.0] to match model's expected input
+            front_image_tensor = front_image_tensor * 255.0
+            
+        if do_hflip:
+            # Spatial: Flip the image tensor horizontally
+            front_image_tensor = TF.hflip(front_image_tensor)
+        # ----------------------------------
+                
+        # 2. Extract 3D Bounding Boxes and Project geometrically to 2D
+        bboxes = np.zeros((self.max_boxes, 10), dtype=np.float32)
+        valid_idx = 0
+        
+        # ---> SCALED CAMERA INTRINSICS (50%) <---
+        IMAGE_WIDTH = 960.0
+        IMAGE_HEIGHT = 640.0
+        FOCAL_LENGTH = 1000.0
+        CAMERA_HEIGHT_OFFSET = 1.5 
+        
+        for label in frame.laser_labels:
+            if valid_idx >= self.max_boxes:
+                break
+                
+            x = label.box.center_x # Depth (Forward)
+            y = label.box.center_y # Horizontal (Left)
+            z = label.box.center_z # Vertical (Up)
+            heading = label.box.heading
+            
+            # ---> APPLY SPATIAL FLIP TO 3D TARGETS <---
+            if do_hflip:
+                y = -y
+                heading = -heading
+            # ------------------------------------------
+            
+            # Step 1: Physical FOV Filter 
+            if x > 2.0 and abs(y / x) < 0.6: 
+                
+                # Step 2: Geometric Projection
+                pixel_x = (IMAGE_WIDTH / 2) - (FOCAL_LENGTH * y / x)
+                pixel_y = (IMAGE_HEIGHT / 2) - (FOCAL_LENGTH * (z - CAMERA_HEIGHT_OFFSET) / x)
+                
+                # Step 3: Validate the projection lands inside the 960x640 image frame
+                if 0 <= pixel_x < IMAGE_WIDTH and 0 <= pixel_y < IMAGE_HEIGHT:
+                    bboxes[valid_idx, 0] = label.type  
+                    bboxes[valid_idx, 1] = pixel_x
+                    bboxes[valid_idx, 2] = pixel_y
+                    bboxes[valid_idx, 3] = x
+                    bboxes[valid_idx, 4] = y
+                    bboxes[valid_idx, 5] = z
+                    bboxes[valid_idx, 6] = label.box.length
+                    bboxes[valid_idx, 7] = label.box.width
+                    bboxes[valid_idx, 8] = label.box.height
+                    bboxes[valid_idx, 9] = heading  
+                    
+                    valid_idx += 1
 
         return {
             'timestamp': torch.tensor(frame.timestamp_micros, dtype=torch.int64),
             'front_image': front_image_tensor,
             'bboxes': torch.from_numpy(bboxes),
-            'num_valid_boxes': torch.tensor(num_valid_boxes, dtype=torch.int32)
+            'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32)
         }
 
-# --- Testing the Class ---
 if __name__ == '__main__':
-    data_path = 'data/raw/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
-    
+    data_path = 'data/raw/train/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
+    if not os.path.exists(data_path):
+        import glob
+        train_files = glob.glob('data/raw/train/*.tfrecord')
+        if train_files:
+            data_path = train_files[0]
+            
     waymo_data = WaymoDataset(data_path)
     dataloader = DataLoader(waymo_data, batch_size=4, shuffle=False)
     
     for batch in dataloader:
         print("\n--- Batch Extracted ---")
         print(f"Front Image Batch Shape: {batch['front_image'].shape}")
-        
-        # Check the new bounding box shapes
-        bbox_shape = batch['bboxes'].shape
-        print(f"Bounding Box Batch Shape: {bbox_shape}")
-        print(f"Dimensions: [Batch_Size, Max_Boxes, Box_Attributes (Class + 7D Coords)]")
-        print(f"Valid boxes per frame in this batch: {batch['num_valid_boxes'].tolist()}")
+        print(f"Bounding Box Batch Shape: {batch['bboxes'].shape}")
+        print(f"Valid visible boxes per frame: {batch['num_valid_boxes'].tolist()}")
         break

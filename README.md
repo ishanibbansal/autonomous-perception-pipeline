@@ -23,10 +23,21 @@ To replicate this environment, both the host and client must be authenticated on
    - Connect via VS Code Remote-SSH.
 
 ## Data Pipeline (Sprint 1)
-*Documentation coming soon...*
 
-## Model Training (Sprint 2)
-*Documentation coming soon...*
+The pipeline ingests raw `.tfrecord` files from the Waymo Open Dataset and prepares them for monocular 3D spatial regression. 
+
+* **Monocular 3D Labels:** The custom machine learning dataset class explicitly captures 3D bounding box target labels (`[X, Y, Z, Length, Width, Height, Heading]`) to properly train the network on physical depth and volume metrics.
+* **Sensor Fusion & Geometric Projection:** To reconcile mismatched human-annotated IDs across sensors, the pipeline uses a pinhole camera model (`focal_length = 2000.0`, `camera_height = 1.5m`) to mathematically project 3D LiDAR geometry onto the 2D front camera plane. A forward-FOV filter dynamically drops any labels physically located behind the ego-vehicle.
+* **Spatial Grid Encoding:** Bounding boxes are processed into a 10D tensor. The 2D image pixels are used to map vehicles to a discrete spatial grid, while the raw, un-normalized 3D meters are preserved and assigned to the grid cells as physical regression targets for the loss function.
+
+## Model Training & Inference (Sprint 2)
+
+The perception model combines a pre-trained feature extractor with a custom volumetric head designed to predict 3D bounding boxes from a single monocular camera frame.
+
+* **Backbone & Custom 3D Head:** Uses a YOLOv8n feature extractor paired with `Head3D` to branch outputs into object classification, 3D center location coordinates (with Sigmoid-constrained X/Y grid offsets and unconstrained absolute depth), box dimensions, and heading orientation angles (`sin(yaw)`, `cos(yaw)`).
+* **Partial Backbone Unfreezing & Differential Learning Rates:** To bypass the limitations of 2D COCO pre-trained weights, layers 0–4 of the backbone are frozen to retain low-level edge features, while layers 5–9 are unfrozen. Differential learning rates (`1e-5` for backbone layers, `1e-3` for the custom head) allow the network to adapt to spatial depth and geometry without disrupting foundational weights.
+* **Training Safeguards & Optimization:** Employs gradient norm clipping (`max_norm=5.0`) to eliminate gradient spikes and NaN loss corruption, alongside dynamic best-checkpoint tracking (`best_waymo_3d_checkpoint.pt`) based on peak validation mAP.
+* **Inference Post-Processing:** Incorporates Non-Max Suppression (NMS) via a Bird's-Eye-View (BEV) distance proxy to eliminate redundant anchor overlapping and cluster predictions cleanly onto foreground vehicles.
 
 ## Telemetry & Visualization (Sprint 3)
 *Documentation coming soon...*
