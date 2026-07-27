@@ -20,13 +20,16 @@ def centernet_focal_loss(pred, target, alpha=2.0, beta=4.0):
     return -(pos_loss.sum() + neg_loss.sum()) / num_pos
 
 class Waymo3DLoss(nn.Module):
-    def __init__(self, cls_weight=1.0, loc_weight=5.0, depth_weight=1.0, dim_weight=5.0, orient_weight=2.0):
+    def __init__(self):
         super().__init__()
-        self.cls_weight = cls_weight
-        self.loc_weight = loc_weight
-        self.depth_weight = depth_weight
-        self.dim_weight = dim_weight
-        self.orient_weight = orient_weight
+        
+        # Learnable uncertainty parameters initialized to 0. 
+        # exp(0) = 1, so the initial multiplier for all losses starts at 1.0.
+        self.s_cls = nn.Parameter(torch.zeros(1))
+        self.s_loc = nn.Parameter(torch.zeros(1))
+        self.s_depth = nn.Parameter(torch.zeros(1))
+        self.s_dim = nn.Parameter(torch.zeros(1))
+        self.s_orient = nn.Parameter(torch.zeros(1))
         
         self.depth_bin_loss_fn = nn.CrossEntropyLoss(reduction='none') 
         self.smooth_l1_none = nn.SmoothL1Loss(reduction='none')        
@@ -35,7 +38,7 @@ class Waymo3DLoss(nn.Module):
         mask = targets['mask']  # Shape: [Batch, 1, H, W]
         num_active = mask.sum().clamp(min=1.0)
         
-        # 1. Heatmap Focal Loss (computed over entire grid)
+        # 1. Heatmap Focal Loss
         cls_loss = centernet_focal_loss(predictions['class'], targets['class'])
         
         # Expand masks
@@ -46,8 +49,7 @@ class Waymo3DLoss(nn.Module):
         loc_elem = self.smooth_l1_none(predictions['location'], targets['location'])
         loc_loss = (loc_elem * mask_2d).sum() / (num_active * 2.0 + 1e-6)
         
-        # 3. Bin-Based Depth Loss (Classification + Residual)
-        # CrossEntropy expects [B, Classes, H, W] and targets [B, H, W] (LongTensor)
+        # 3. Bin-Based Depth Loss
         depth_bin_elem = self.depth_bin_loss_fn(predictions['depth_bin'], targets['depth_bin'])
         depth_bin_loss = (depth_bin_elem * mask.squeeze(1)).sum() / num_active
         
@@ -63,13 +65,15 @@ class Waymo3DLoss(nn.Module):
         orient_elem = self.smooth_l1_none(predictions['orientation'], targets['orientation'])
         orient_loss = (orient_elem * mask_2d).sum() / (num_active * 2.0 + 1e-6)
         
-        total_loss = (
-            self.cls_weight * cls_loss +
-            self.loc_weight * loc_loss +
-            self.depth_weight * total_depth_loss +
-            self.dim_weight * dim_loss +
-            self.orient_weight * orient_loss
-        )
+        # 5. Apply Homoscedastic Uncertainty Weighting
+        weighted_cls = cls_loss * torch.exp(-self.s_cls) + self.s_cls
+        weighted_loc = loc_loss * torch.exp(-self.s_loc) + self.s_loc
+        weighted_depth = total_depth_loss * torch.exp(-self.s_depth) + self.s_depth
+        weighted_dim = dim_loss * torch.exp(-self.s_dim) + self.s_dim
+        weighted_orient = orient_loss * torch.exp(-self.s_orient) + self.s_orient
+        
+        # Squeeze to ensure scalar addition
+        total_loss = (weighted_cls + weighted_loc + weighted_depth + weighted_dim + weighted_orient).squeeze()
         
         return total_loss, {
             'cls_loss': cls_loss.item(),
