@@ -61,10 +61,42 @@ class Waymo3DDetector(nn.Module):
         self.backbone_modules = list(base_yolo.model.model.children())[:10]
         self.backbone = nn.Sequential(*self.backbone_modules)
         
+        # ---> NEW: 4-CHANNEL EARLY FUSION STEM <---
+        old_stem = self.backbone[0].conv
+        
+        new_stem = nn.Conv2d(
+            in_channels=4,  # RGB (3) + LiDAR Depth (1)
+            out_channels=old_stem.out_channels,
+            kernel_size=old_stem.kernel_size,
+            stride=old_stem.stride,
+            padding=old_stem.padding,
+            bias=(old_stem.bias is not None)
+        )
+        
+        with torch.no_grad():
+            # Copy the pretrained RGB weights perfectly into the first 3 channels
+            new_stem.weight[:, :3, :, :] = old_stem.weight
+            
+            # Zero-initialize the 4th (Depth) channel
+            new_stem.weight[:, 3:4, :, :] = 0.0
+            
+            if old_stem.bias is not None:
+                new_stem.bias = old_stem.bias
+                
+        # Swap the newly minted 4-channel stem back into the backbone
+        self.backbone[0].conv = new_stem
+        # ------------------------------------------
+        
+        # Freeze initial layers, leave deeper layers and new stem to train
         for idx, module in enumerate(self.backbone):
             for param in module.parameters():
                 if idx <= 4:
-                    param.requires_grad = False
+                    # Note: We must ensure the new stem (idx == 0) is trainable 
+                    # so it learns the depth channel representation.
+                    if idx == 0:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
                 else:
                     param.requires_grad = True
             
@@ -77,9 +109,10 @@ class Waymo3DDetector(nn.Module):
 
 if __name__ == '__main__':
     model = Waymo3DDetector()
-    dummy_input = torch.randn(1, 3, 640, 960)
+    # Changed input to 4 channels to test the new Early Fusion architecture
+    dummy_input = torch.randn(1, 4, 640, 960)
     
-    print("\nExecuting forward pass with custom 3D heads...")
+    print("\nExecuting forward pass with custom 4-channel fusion backbone...")
     outputs = model(dummy_input)
     
     print("\n--- Output Tensor Shapes ---")
