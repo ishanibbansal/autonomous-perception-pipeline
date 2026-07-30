@@ -160,9 +160,15 @@ class WaymoDataset(Dataset):
         is_train = 'train' in self.tfrecord_path
         if is_train:
             front_image_tensor = front_image_tensor.float() / 255.0
-            jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
-            if random.random() > 0.5:
+            
+            # STRONGER AUGMENTATIONS
+            jitter = T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+            if random.random() > 0.4:
                 front_image_tensor = jitter(front_image_tensor)
+                
+            if random.random() > 0.5:
+                front_image_tensor = TF.adjust_sharpness(front_image_tensor, sharpness_factor=random.uniform(0.5, 2.0))
+                
             front_image_tensor = front_image_tensor * 255.0
             
             if random.random() > 0.5:

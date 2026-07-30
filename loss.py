@@ -25,18 +25,15 @@ class BEVFocalLoss(nn.Module):
             targets: [B, 1, H, W] tensor of ground truth binary occupancy (1.0 or 0.0).
         """
         # 1. Calculate standard Binary Cross-Entropy (BCE) with logits
-        # We use reduction='none' so we can apply the focal weights pixel-by-pixel
         bce_loss = F.binary_cross_entropy_with_logits(predictions, targets, reduction='none')
         
         # 2. Get the probabilities by applying sigmoid to the logits
         probs = torch.sigmoid(predictions)
         
         # 3. Calculate p_t (the probability of the true class)
-        # If target is 1, p_t = prob. If target is 0, p_t = 1 - prob.
         p_t = probs * targets + (1 - probs) * (1 - targets)
         
         # 4. Apply the alpha weighting
-        # alpha for positive class (targets==1), (1-alpha) for negative class (targets==0)
         alpha_weight = self.alpha * targets + (1 - self.alpha) * (1 - targets)
         
         # 5. Calculate the final focal weight: alpha * (1 - p_t)^gamma
@@ -52,8 +49,35 @@ class BEVFocalLoss(nn.Module):
         else:
             return focal_loss
 
+class CombinedBEVLoss(nn.Module):
+    def __init__(self, focal_loss, iou_weight=1.0):
+        """
+        Combines BEVFocalLoss with a differentiable Soft-IoU loss.
+        Focal Loss stabilizes pixel classification; Soft-IoU sharpens box boundaries.
+        """
+        super().__init__()
+        self.focal_loss = focal_loss
+        self.iou_weight = iou_weight
+
+    def forward(self, predictions, targets):
+        # 1. Standard focal loss
+        focal = self.focal_loss(predictions, targets)
+        
+        # 2. Differentiable Soft-IoU
+        preds_prob = torch.sigmoid(predictions)
+        
+        # Sum across spatial grid dimensions (B, C, H, W)
+        intersection = (preds_prob * targets).sum(dim=(-2, -1))
+        union = preds_prob.sum(dim=(-2, -1)) + targets.sum(dim=(-2, -1)) - intersection
+        
+        # Add epsilon to prevent division by zero
+        soft_iou = (intersection + 1e-6) / (union + 1e-6)
+        iou_loss = (1.0 - soft_iou).mean()
+        
+        return focal + (self.iou_weight * iou_loss)
+
 if __name__ == '__main__':
-    print("Testing BEVFocalLoss...")
+    print("Testing CombinedBEVLoss...")
     
     # Simulate a batch of 2 grids, 160x160
     dummy_logits = torch.randn(2, 1, 160, 160)
@@ -62,7 +86,8 @@ if __name__ == '__main__':
     dummy_targets = torch.zeros(2, 1, 160, 160)
     dummy_targets[:, :, 75:85, 75:85] = 1.0  # Simulate a 10x10 vehicle in the center
     
-    criterion = BEVFocalLoss(alpha=0.25, gamma=2.0)
+    base_focal = BEVFocalLoss(alpha=0.25, gamma=2.0)
+    criterion = CombinedBEVLoss(focal_loss=base_focal, iou_weight=1.0)
     loss = criterion(dummy_logits, dummy_targets)
     
     print(f"Loss value: {loss.item():.4f}")

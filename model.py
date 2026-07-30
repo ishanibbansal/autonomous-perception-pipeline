@@ -4,57 +4,82 @@ import torch.nn.functional as F
 import math
 from ultralytics import YOLO
 
+class ViewTransformer(nn.Module):
+    """
+    Transforms perspective camera features into a top-down BEV grid 
+    by collapsing the vertical axis (height) and projecting it to depth.
+    """
+    def __init__(self, in_channels, out_channels, cam_h=20, cam_w=30, bev_h=160, bev_w=160):
+        super().__init__()
+        self.cam_h = cam_h
+        self.cam_w = cam_w
+        self.bev_h = bev_h
+        self.bev_w = bev_w
+        
+        # Flatten the channel and height dimensions, then linearly project to BEV depth
+        self.fc_depth = nn.Linear(in_channels * cam_h, out_channels * bev_h)
+        
+        # Spatial refinement in BEV space
+        self.bev_refine = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # Reorganize: [B, C, H, W] -> [B, W, C, H] -> [B, W, C * H]
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.view(B, W, C * H)
+        
+        # Project image height into BEV depth: [B, W, out_channels * bev_h]
+        x = self.fc_depth(x)
+        
+        # Reorganize: [B, W, out_channels * bev_h] -> [B, out_channels, bev_h, W]
+        x = x.view(B, W, -1, self.bev_h)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        
+        # Interpolate the width dimension to match BEV width (160)
+        x = F.interpolate(x, size=(self.bev_h, self.bev_w), mode='bilinear', align_corners=False)
+        
+        return self.bev_refine(x)
+
 class BEVDecoder(nn.Module):
-    """
-    Transforms perspective-view features into a top-down BEV occupancy grid.
-    Upsamples a 20x30 feature map into a 160x160 spatial grid.
-    """
     def __init__(self, in_channels=256):
         super().__init__()
         
-        # Step 1: Spatial Transformer 
-        # Maps the 3:2 aspect ratio of the camera to a 1:1 square for the BEV grid
-        self.perspective_to_bev = nn.AdaptiveAvgPool2d((20, 20))
-        
-        # Step 2: Upsample 20x20 -> 40x40
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, 128, kernel_size=2, stride=2),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
+        # Step 1: Geometric Transformation from Image to BEV Space
+        self.view_transformer = ViewTransformer(
+            in_channels=in_channels, 
+            out_channels=64, 
+            cam_h=20, cam_w=30, 
+            bev_h=160, bev_w=160
         )
         
-        # Step 3: Upsample 40x40 -> 80x80
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+        # Step 2: BEV Feature processing with Spatial Dropout
+        self.decoder_blocks = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Step 4: Upsample 80x80 -> 160x160
-        self.up3 = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.2), # <--- ADDED SPATIAL DROPOUT
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.2)  # <--- ADDED SPATIAL DROPOUT BEFORE HEAD
         )
         
-        # Step 5: Final mapping to a single-channel occupancy logit
-        self.occupancy_head = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        # Step 3: Final mapping to a single-channel occupancy logit
+        self.occupancy_head = nn.Conv2d(32, 1, kernel_size=1)
         
-        # ---> PRIOR PROBABILITY BIAS INITIALIZATION <---
-        # Set the bias so the network predicts a 0.01 probability of a vehicle at initialization.
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         torch.nn.init.constant_(self.occupancy_head.bias, bias_value)
 
     def forward(self, x):
-        # x is [B, 256, 20, 30] from YOLO backbone
-        x = self.perspective_to_bev(x)  # -> [B, 256, 20, 20]
-        x = self.up1(x)                 # -> [B, 128, 40, 40]
-        x = self.up2(x)                 # -> [B, 64, 80, 80]
-        x = self.up3(x)                 # -> [B, 32, 160, 160]
-        
-        # We output raw logits (no sigmoid) for numerical stability during training
-        logits = self.occupancy_head(x) # -> [B, 1, 160, 160]
+        # x is [B, 256, 20, 30]
+        bev_features = self.view_transformer(x)    # -> [B, 64, 160, 160]
+        bev_features = self.decoder_blocks(bev_features) # -> [B, 32, 160, 160]
+        logits = self.occupancy_head(bev_features) # -> [B, 1, 160, 160]
         
         return {'bev_occupancy': logits}
 
@@ -62,49 +87,31 @@ class WaymoBEVDetector(nn.Module):
     def __init__(self, yolo_version='yolov8n.pt'):
         super().__init__()
         print(f"Loading pre-trained {yolo_version} backbone...")
-        
         base_yolo = YOLO(yolo_version)
         self.backbone_modules = list(base_yolo.model.model.children())[:10]
         self.backbone = nn.Sequential(*self.backbone_modules)
         
-        # ---> 4-CHANNEL EARLY FUSION STEM <---
         old_stem = self.backbone[0].conv
-        
         new_stem = nn.Conv2d(
-            in_channels=4,  # RGB (3) + LiDAR Depth (1)
-            out_channels=old_stem.out_channels,
-            kernel_size=old_stem.kernel_size,
-            stride=old_stem.stride,
-            padding=old_stem.padding,
-            bias=(old_stem.bias is not None)
+            in_channels=4, out_channels=old_stem.out_channels,
+            kernel_size=old_stem.kernel_size, stride=old_stem.stride,
+            padding=old_stem.padding, bias=(old_stem.bias is not None)
         )
-        
         with torch.no_grad():
-            # Copy the pretrained RGB weights perfectly into the first 3 channels
             new_stem.weight[:, :3, :, :] = old_stem.weight
-            
-            # Zero-initialize the 4th (Depth) channel
             new_stem.weight[:, 3:4, :, :] = 0.0
-            
             if old_stem.bias is not None:
                 new_stem.bias = old_stem.bias
                 
-        # Swap the newly minted 4-channel stem back into the backbone
         self.backbone[0].conv = new_stem
-        # ------------------------------------------
         
-        # Freeze initial layers, leave deeper layers and new stem to train
         for idx, module in enumerate(self.backbone):
             for param in module.parameters():
-                if idx <= 4:
-                    if idx == 0:
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
+                if idx <= 7:
+                    param.requires_grad = (idx == 0)
                 else:
                     param.requires_grad = True
             
-        # Swap out the 3D head for the new BEV Decoder
         self.bev_head = BEVDecoder(in_channels=256)
             
     def forward(self, x):
@@ -115,8 +122,6 @@ class WaymoBEVDetector(nn.Module):
 if __name__ == '__main__':
     model = WaymoBEVDetector()
     dummy_input = torch.randn(1, 4, 640, 960)
-    
-    print("\nExecuting forward pass with BEV fusion architecture...")
     outputs = model(dummy_input)
     
     print("\n--- Output Tensor Shapes ---")
