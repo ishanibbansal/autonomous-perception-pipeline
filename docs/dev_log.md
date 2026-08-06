@@ -60,3 +60,32 @@ This file serves as a living technical journal for the project. It tracks active
   2. **Bin-Based Depth Classification + Residual:** Mapped continuous forward depth into discrete bins (e.g., 40 bins up to 80 meters) trained with Cross-Entropy loss, combined with a sigmoid-constrained local residual branch (`SmoothL1Loss`) for fine-grained depth precision.
   3. **Stabilized Gradients:** Allowed the network to organically learn spatial and metric distributions instead of harsh, all-or-nothing grid constraints, driving immediate validation improvements right out of Epoch 1.
   4. **Stable Orientation & Dimension Regression:** Utilized continuous sine/cosine angle representations ($\sin(\text{yaw}), \cos(\text{yaw})$) instead of raw radians to prevent angular discontinuity wraparound bugs during loss calculation, paired with direct metric regression for length, width, and height.
+
+### Log 2.3: Reaching 10% Monocular mAP & The Transition to Modular BEV Fusion
+* **Date:** July 26, 2026
+* **Milestone:** Reached a peak Validation mAP of **0.1017 (10.17%)** at Epoch 38 on an IoU threshold of 0.25 using pure monocular 3D detection with CenterNet heatmaps, discrete bin-based depth classification, and target-aware data augmentations (`ColorJitter` + horizontal spatial flipping).
+* **Symptom & Bottleneck:** 
+  1. While Training Loss dropped steadily from `37.62` down to `0.8437`, Validation Loss diverged upward to `12.9696`.
+  2. The massive spread between training and validation loss indicated clear overfitting: the deep feature extractor memorized the lighting, background structures, and vehicle shadows of the ~2,000 training frames.
+  3. Inferring 3D spatial depth purely from 2D pixel scale remains an ill-posed monocular problem. Low-confidence false positives in the background inflated the grid focal loss, while primary vehicle bounding boxes suffered from physical depth jitter on unseen validation scenes.
+* **Strategic Architectural Pivot:** Transitioned from single-view 2D image-plane prediction to a **Modular Bird's-Eye View (BEV) Sensor Fusion Architecture**, combining perspective camera semantics with physical LiDAR point cloud telemetry.
+* **Codebase Integration & Reusability:**
+  * **YOLOv8 Backbone (`model.py`):** Retained 100% to extract high-level 2D semantic feature representations from perspective front-camera frames.
+  * **Data Pipeline (`WaymoDataset` in `dataset.py`):** Maintained all existing photometric augmentations, horizontal flipping logic (`y = -y`, `heading = -heading`), and camera intrinsic matrices ($F_x, F_y, C_x, C_y$). Expanded the parser to read raw point cloud tensors directly from the `.tfrecord` laser returns to extract exact physical depth measurements.
+  * **Loss & Head Modules (`loss.py`):** Retained the CenterNet Focal Loss for objectness classification along with Smooth L1 / Cross-Entropy loss for depth bins, dimensions, and orientations. Re-projected the target coordinate space from image-plane pixels $(u, v)$ to top-down physical ego-vehicle grid cells $(X, Y)$ on a metric 2D BEV plane.
+  * **Downstream Alignment:** Transforming predictions onto a top-down BEV occupancy grid establishes the 1:1 metric spatial mapping mandatory for downstream trajectory prediction (calculating $\frac{dX}{dt}, \frac{dY}{dt}$) and motion planning.
+
+### Log 2.4: The Mirrored BEV Coordinate Grid Bug
+* **Date:** July 29, 2026
+* **Symptom:** TensorBoard visualizer revealed that the predicted BEV heatmaps were perfectly horizontally mirrored compared to the ground truth grid. The model correctly identified vehicle locations and shapes, but projected them onto the opposite side of the road.
+* **Root Cause:** In `target_encoder.py`, the target calculation explicitly inverted the lateral axis to map world Y to camera X (`self.grid_w - ...`). However, the CNN feature extractor naturally preserves the left-to-right pixel mapping of the camera all the way through the spatial projection. Flipping the ground truth targets but not the features forced the model to learn a horizontally mirrored projection.
+* **Solution:** Removed the explicit inversion (`self.grid_w -`) from the grid corner calculation inside `target_encoder.py`. Restarted the training run with a clean TensorBoard cache, instantly resolving the axis collision and aligning the prediction gradients perfectly with the ground truth targets.
+
+### Log 2.5: Combating BEV Overfitting with Aggressive Regularization
+* **Date:** July 29, 2026
+* **Symptom:** During Epoch 6 of the BEV fusion architecture, training loss aggressively dropped to `0.5400`, creating highly accurate visualizations on the training frames. However, Validation Soft-IoU was cut in half (dropping from a peak of `0.0178` down to `0.0088`), indicating textbook data memorization.
+* **Root Cause:** The BEV head was assigned an aggressive learning rate of `1e-3` from Epoch 1 with weak weight decay. The network quickly forged brittle, high-magnitude edge weights to map specific static backgrounds and artifacts of the `.tfrecord` training splits rather than learning invariant geometry. 
+* **Solution:** Paused training and injected three regularization safeguards:
+  1. **Weight Decay Increase:** Bumped `weight_decay` in the AdamW optimizer from `1e-4` to `1e-3` to penalize overly confident, brittle feature dependencies.
+  2. **Linear LR Warmup:** Introduced `SequentialLR` to apply a 2-epoch linear warmup (starting at `0.1x` of the base rate) before shifting into the cosine decay schedule. This prevents the head from locking into poor spatial representations early in training.
+  3. **Targeted Perturbations:** Amplified `ColorJitter` ranges and introduced randomized sharpness scaling to the `WaymoDataset` pipeline. This actively distorts static photometric cues, forcing the backbone to encode true structural outlines of the vehicles instead of local color artifacts.

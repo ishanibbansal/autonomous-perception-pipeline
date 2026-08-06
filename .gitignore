@@ -28,6 +28,7 @@ models/
 # Logs & Training Outputs
 *.log
 outputs/
+runs/
 
 # Image Files & Visualizations
 *.jpg

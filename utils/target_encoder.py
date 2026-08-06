@@ -1,122 +1,102 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import torch
 import math
+import numpy as np
 
-class TargetEncoder:
-    def __init__(self, image_width=960, image_height=640, grid_w=30, grid_h=20, max_depth=80.0, num_depth_bins=40):
-        """
-        Maps raw 3D bounding box lists into dense spatial grids with CenterNet-style 
-        heatmaps and bin-based depth targets.
-        """
-        self.grid_w = grid_w
-        self.grid_h = grid_h
-        
-        self.stride_x = image_width / grid_w
-        self.stride_y = image_height / grid_h
-        
-        self.max_depth = max_depth
-        self.num_depth_bins = num_depth_bins
-        self.bin_size = max_depth / num_depth_bins
+class BEVGridEncoder:
+    def __init__(self, x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160):
+        self.x_range = x_range
+        self.y_range = y_range
+        self.grid_h = bev_h
+        self.grid_w = bev_w
+        self.res_x = (x_range[1] - x_range[0]) / bev_h  
+        self.res_y = (y_range[1] - y_range[0]) / bev_w  
 
     def _render_gaussian(self, heatmap, center_x, center_y, sigma=1.0):
-        """Applies a 2D Gaussian splat to the heatmap for CenterNet-style classification."""
         radius = int(3 * sigma)
-        for y in range(max(0, center_y - radius), min(self.grid_h, center_y + radius + 1)):
-            for x in range(max(0, center_x - radius), min(self.grid_w, center_x + radius + 1)):
-                dist = (x - center_x)**2 + (y - center_y)**2
-                val = math.exp(-dist / (2 * (sigma**2)))
-                heatmap[y, x] = max(heatmap[y, x], val)
+        y_min = max(0, center_y - radius)
+        y_max = min(self.grid_h, center_y + radius + 1)
+        x_min = max(0, center_x - radius)
+        x_max = min(self.grid_w, center_x + radius + 1)
+        
+        if y_min >= y_max or x_min >= x_max:
+            return heatmap
+            
+        yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
+        dist = (xx - center_x)**2 + (yy - center_y)**2
+        val = np.exp(-dist / (2 * (sigma**2)))
+        heatmap[y_min:y_max, x_min:x_max] = np.maximum(heatmap[y_min:y_max, x_min:x_max], val)
         return heatmap
 
     def encode(self, bboxes, num_valid_boxes):
         batch_size = bboxes.shape[0]
+        bev_grids = np.zeros((batch_size, 1, self.grid_h, self.grid_w), dtype=np.float32)
         
-        target_cls = torch.zeros((batch_size, 3, self.grid_h, self.grid_w))
-        target_loc = torch.zeros((batch_size, 2, self.grid_h, self.grid_w)) # Only X, Y offsets
-        target_depth_bin = torch.zeros((batch_size, self.grid_h, self.grid_w), dtype=torch.long)
-        target_depth_res = torch.zeros((batch_size, 1, self.grid_h, self.grid_w))
-        target_dim = torch.zeros((batch_size, 3, self.grid_h, self.grid_w))
-        target_ori = torch.zeros((batch_size, 2, self.grid_h, self.grid_w))
-        mask = torch.zeros((batch_size, 1, self.grid_h, self.grid_w))
+        dim_grids = np.zeros((batch_size, 3, self.grid_h, self.grid_w), dtype=np.float32)
+        ori_grids = np.zeros((batch_size, 2, self.grid_h, self.grid_w), dtype=np.float32)
+        # --- NEW: Offset Grid ---
+        offset_grids = np.zeros((batch_size, 2, self.grid_h, self.grid_w), dtype=np.float32)
+        mask_grids = np.zeros((batch_size, 1, self.grid_h, self.grid_w), dtype=np.float32)
         
         for b in range(batch_size):
             valid_count = num_valid_boxes[b].item()
-            
             for i in range(valid_count):
                 box = bboxes[b, i]
-                cls_id = int(box[0].item()) - 1  
                 
-                pixel_x, pixel_y = box[1].item(), box[2].item()
-                cx, cy, cz = box[3].item(), box[4].item(), box[5].item()
+                x, y = box[3].item(), box[4].item()
                 length, width, height = box[6].item(), box[7].item(), box[8].item()
                 heading = box[9].item()
                 
-                grid_x = int(pixel_x / self.stride_x)
-                grid_y = int(pixel_y / self.stride_y)
+                if not (self.x_range[0] <= x <= self.x_range[1] and self.y_range[0] <= y <= self.y_range[1]):
+                    continue
+                    
+                # 1. Calculate continuous floating-point grid coordinates
+                ctx_feat = (y - self.y_range[0]) / self.res_y
+                cty_feat = self.grid_h - 1 - ((x - self.x_range[0]) / self.res_x)
                 
-                if 0 <= grid_x < self.grid_w and 0 <= grid_y < self.grid_h and 0 <= cls_id < 3:
-                    mask[b, 0, grid_y, grid_x] = 1.0
-                    
-                    # 1. Heatmap Classification
-                    target_cls[b, cls_id] = self._render_gaussian(target_cls[b, cls_id], grid_x, grid_y, sigma=1.0)
-                    
-                    # 2. 2D Center Offsets
-                    offset_x = (pixel_x / self.stride_x) - grid_x
-                    offset_y = (pixel_y / self.stride_y) - grid_y
-                    target_loc[b, 0, grid_y, grid_x] = offset_x
-                    target_loc[b, 1, grid_y, grid_x] = offset_y
-                    
-                    # 3. Bin-Based Depth Encoding
-                    depth_clamped = min(max(cx, 0.0), self.max_depth - 1e-4)
-                    bin_idx = int(depth_clamped / self.bin_size)
-                    residual = (depth_clamped - (bin_idx * self.bin_size)) / self.bin_size
-                    
-                    target_depth_bin[b, grid_y, grid_x] = bin_idx
-                    target_depth_res[b, 0, grid_y, grid_x] = residual
-                    
-                    # 4. Dimensions & Orientation
-                    target_dim[b, 0, grid_y, grid_x] = length
-                    target_dim[b, 1, grid_y, grid_x] = width
-                    target_dim[b, 2, grid_y, grid_x] = height
-                    
-                    target_ori[b, 0, grid_y, grid_x] = math.sin(heading)
-                    target_ori[b, 1, grid_y, grid_x] = math.cos(heading)
-                    
+                # 2. Get discrete integer grid indices
+                grid_cx = int(ctx_feat)
+                grid_cy = int(cty_feat)
+                
+                # 3. Calculate fractional sub-pixel offset (The missing 0.0 to 1.0 remainder)
+                offset_x = ctx_feat - grid_cx
+                offset_y = cty_feat - grid_cy
+                
+                # Clamp boundaries safely
+                grid_cx = max(0, min(grid_cx, self.grid_w - 1))
+                grid_cy = max(0, min(grid_cy, self.grid_h - 1))
+                
+                radius_x = max(1.5, (length / self.res_x) / 2.0)
+                radius_y = max(1.5, (width / self.res_y) / 2.0)
+                sigma = max(1.5, max(radius_x, radius_y) / 2.0) 
+                
+                bev_grids[b, 0] = self._render_gaussian(bev_grids[b, 0], grid_cx, grid_cy, sigma=sigma)
+                
+                radius = int(sigma)
+                y_min = max(0, grid_cy - radius)
+                y_max = min(self.grid_h, grid_cy + radius + 1)
+                x_min = max(0, grid_cx - radius)
+                x_max = min(self.grid_w, grid_cx + radius + 1)
+                
+                dim_grids[b, 0, y_min:y_max, x_min:x_max] = length
+                dim_grids[b, 1, y_min:y_max, x_min:x_max] = width
+                dim_grids[b, 2, y_min:y_max, x_min:x_max] = height
+                
+                ori_grids[b, 0, y_min:y_max, x_min:x_max] = math.sin(heading)
+                ori_grids[b, 1, y_min:y_max, x_min:x_max] = math.cos(heading)
+                
+                # --- NEW: Assign offset targets ---
+                offset_grids[b, 0, y_min:y_max, x_min:x_max] = offset_x
+                offset_grids[b, 1, y_min:y_max, x_min:x_max] = offset_y
+                
+                mask_grids[b, 0, y_min:y_max, x_min:x_max] = 1.0 
+                
         return {
-            'class': target_cls,
-            'location': target_loc,
-            'depth_bin': target_depth_bin,
-            'depth_res': target_depth_res,
-            'dimensions': target_dim,
-            'orientation': target_ori,
-            'mask': mask
+            'bev_occupancy': torch.from_numpy(bev_grids),
+            'dimensions': torch.from_numpy(dim_grids),
+            'orientation': torch.from_numpy(ori_grids),
+            'offset': torch.from_numpy(offset_grids),
+            'mask': torch.from_numpy(mask_grids)
         }
-
-if __name__ == '__main__':
-    from dataset import WaymoDataset
-    from torch.utils.data import DataLoader
-
-    print("Initializing TargetEncoder Test...")
-    data_path = 'data/raw/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord'
-    
-    try:
-        waymo_data = WaymoDataset(data_path)
-        dataloader = DataLoader(waymo_data, batch_size=4, shuffle=False)
-        batch = next(iter(dataloader))
-        
-        encoder = TargetEncoder(image_width=960, image_height=640, grid_w=30, grid_h=20)
-        targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
-        
-        print("\n--- Encoded Target Shapes ---")
-        for key, tensor in targets.items():
-            print(f"{key.capitalize():<12}: {tensor.shape}")
-            
-        total_objects_in_batch = batch['num_valid_boxes'].sum().item()
-        total_cells_activated = targets['mask'].sum().item()
-        
-        print("\n--- Validation ---")
-        print(f"Raw valid boxes in batch : {total_objects_in_batch}")
-        print(f"Grid anchors activated   : {int(total_cells_activated)}")
-        print("SUCCESS: TargetEncoder upgraded to Bin-Based Depth + Heatmaps!")
-            
-    except FileNotFoundError:
-        print(f"Test failed: Could not find the dataset at {data_path}.")
