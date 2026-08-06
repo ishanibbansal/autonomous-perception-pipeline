@@ -11,57 +11,38 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from model import WaymoBEVDetector
-from loss import BEVFocalLoss, CombinedBEVLoss
-from utils.dataset import WaymoDataset
+from loss import WaymoDetectionLoss
+from utils.dataset import WaymoDataset, waymo_collate_fn
 from utils.target_encoder import BEVGridEncoder
-
-def freeze_batchnorm(module):
-    """Forces all BatchNorm layers to remain in evaluation mode."""
-    classname = module.__class__.__name__
-    if classname.find('BatchNorm') != -1:
-        module.eval()
-
-def custom_collate_fn(batch):
-    return {
-        'timestamp': torch.stack([item['timestamp'] for item in batch]),
-        'front_image': torch.stack([item['front_image'] for item in batch]),
-        'bboxes': torch.stack([item['bboxes'] for item in batch]),
-        'num_valid_boxes': torch.stack([item['num_valid_boxes'] for item in batch]),
-        'lidar_points': [item['lidar_points'] for item in batch]
-    }
+from utils.validate import validate_model
 
 def train_model(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Initializing Fully Optimized Training on: {device}")
+    print(f"Initializing LiDAR-Camera Sensor Fusion Training on: {device}")
     
     torch.backends.cudnn.benchmark = True
 
-    # 1. Initialize TensorBoard Writer (New directory for fresh run)
-    writer = SummaryWriter(log_dir='runs/bev_experiment_04')
+    writer = SummaryWriter(log_dir='runs/lidar_camera_teacher_01')
     print("TensorBoard initialized. Run 'tensorboard --logdir=runs' to view.")
 
-    # 2. Setup Architecture & Combined Loss (Focal + Soft-IoU)
+    # --- Initialize Model ---
     model = WaymoBEVDetector().to(device)
-    base_focal = BEVFocalLoss(alpha=0.25, gamma=2.0)
-    criterion = CombinedBEVLoss(focal_loss=base_focal, iou_weight=2.0).to(device)
-    encoder = BEVGridEncoder(x_range=(0.0, 80.0), y_range=(-40.0, 40.0), resolution=0.5)
+
+    # --- NEW: Initialize the Master Pipeline Loss ---
+    criterion = WaymoDetectionLoss().to(device)
     
-    epochs = 50
-    ACCUMULATION_STEPS = 4 # Simulates batch size 16 (4 batch * 4 steps)
+    encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
     
-    # REDUCED HEAD LR AND INCREASED WEIGHT DECAY
-    optimizer = optim.AdamW([
-        {'params': model.backbone.parameters(), 'lr': 1e-5},
-        {'params': model.bev_head.parameters(), 'lr': 5e-4}, # Lowered from 1e-3
-    ], weight_decay=2e-3) # Doubled from 1e-3
+    epochs = 15
+    ACCUMULATION_STEPS = 4 
     
-    # LEARNING RATE WARMUP + COSINE DECAY
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)                                               
+    
     warmup_epochs = 2
     warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-8)
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     
-    # AMP Scaler for mixed precision training (RTX 2060 optimization)
     scaler = torch.amp.GradScaler('cuda')
     
     print("Loading Waymo .tfrecord Datasets...")
@@ -74,30 +55,31 @@ def train_model(args):
     if not val_files:
         raise FileNotFoundError("No .tfrecord files found in data/raw/val/")
 
-    train_datasets = [WaymoDataset(tfrecord_path=f) for f in train_files]
+    # Note: Adjust num_sweeps here if needed for CPU testing
+    train_datasets = [WaymoDataset(tfrecord_path=f, is_train=True) for f in train_files]
     train_dataset = ConcatDataset(train_datasets)
     
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=4, 
         shuffle=True, 
-        num_workers=2,               
+        num_workers=2,              
         pin_memory=True, 
-        collate_fn=custom_collate_fn,
+        collate_fn=waymo_collate_fn,
         persistent_workers=True,     
         prefetch_factor=2            
     )
     
-    val_datasets = [WaymoDataset(tfrecord_path=f) for f in val_files]
+    val_datasets = [WaymoDataset(tfrecord_path=f, is_train=False) for f in val_files]
     val_dataset = ConcatDataset(val_datasets)
     
     val_dataloader = DataLoader(
         val_dataset, 
-        batch_size=4, 
+        batch_size=4,             # Bump back up to 4 to cut total batches in half
         shuffle=False, 
-        num_workers=2, 
+        num_workers=2,            # Use 2 workers safely since validation has no gradients/backward pass
         pin_memory=True, 
-        collate_fn=custom_collate_fn,
+        collate_fn=waymo_collate_fn,
         persistent_workers=True,
         prefetch_factor=2
     )
@@ -106,9 +88,8 @@ def train_model(args):
     best_checkpoint_path = "best_waymo_bev_checkpoint.pt"
     best_val_score = 0.0
     start_epoch = 0
-    VAL_INTERVAL = 2 
+    VAL_INTERVAL = 3
 
-    # 3. Handle Checkpoint Resuming
     if args.resume and os.path.exists(best_checkpoint_path):
         print(f"Found existing checkpoint at {best_checkpoint_path}. Resuming training...")
         checkpoint = torch.load(best_checkpoint_path, map_location=device)
@@ -129,35 +110,32 @@ def train_model(args):
     
     for epoch in range(start_epoch, epochs):
         model.train() 
-        model.backbone.apply(freeze_batchnorm) 
         
         epoch_train_loss = 0.0
         batch_start_time = time.time()
         
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
         for batch_idx, batch in enumerate(train_dataloader):
-            images = batch['front_image'].to(device, dtype=torch.float32, non_blocking=True)
-            # Normalize only the 3 RGB channels (leave LiDAR depth in true meters)
-            images[:, :3] = images[:, :3] / 255.0
+            lidar_points = batch['lidar_points'].to(device, non_blocking=True)
+            batch_indices = batch['batch_indices'].to(device, non_blocking=True)
             
-            raw_bboxes = batch['bboxes']
-            valid_boxes = batch['num_valid_boxes']
+            camera_images = batch['camera_images'].to(device, non_blocking=True)
+            lidar_uvs = batch['lidar_uvs'].to(device, non_blocking=True)
             
-            encoded_targets = encoder.encode(raw_bboxes, valid_boxes)
-            targets = encoded_targets['bev_occupancy'].to(device, non_blocking=True)
+            # --- Move Encoded Targets to Device Safely ---
+            encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
+            targets_gpu = {k: v.to(device, non_blocking=True) for k, v in encoded_targets.items()}
             
-            # Execute forward pass with Automatic Mixed Precision
-            with torch.amp.autocast('cuda'):
-                predictions = model(images)
-                loss = criterion(predictions['bev_occupancy'], targets)
-                # Scale loss by accumulation steps
-                loss = loss / ACCUMULATION_STEPS
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                predictions = model(lidar_points, batch_indices, camera_images, lidar_uvs)
+                
+                # --- The Master Loss Wrapper applies automatically ---
+                total_loss = criterion(predictions, targets_gpu)
+                loss = total_loss / ACCUMULATION_STEPS
             
-            # Scale loss and backpropagate
             scaler.scale(loss).backward()
             
-            # Step optimizer and update weights after accumulating N steps
             if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(train_dataloader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
@@ -173,10 +151,10 @@ def train_model(args):
             global_step = epoch * len(train_dataloader) + batch_idx
             writer.add_scalar('Training/Batch_Loss', true_loss, global_step)
             
-            if batch_idx % 100 == 0:
+            if batch_idx % 500 == 0:
                 with torch.no_grad():
                     pred_grid = torch.sigmoid(predictions['bev_occupancy'][0:1]) 
-                    target_grid = targets[0:1]
+                    target_grid = targets_gpu['bev_occupancy'][0:1]
                     writer.add_image('BEV/1_Prediction', pred_grid[0], global_step)
                     writer.add_image('BEV/2_Ground_Truth', target_grid[0], global_step)
             
@@ -187,17 +165,15 @@ def train_model(args):
                 print(f"Epoch {epoch + 1:02d}/{epochs} | Batch {batch_idx:03d} | Loss: {true_loss:.4f} | Speed: {sec_per_batch:.3f} sec/batch")
                 batch_start_time = time.time()
                 
-        # Step the learning rate scheduler at the end of the epoch (suppressing PyTorch SequentialLR internal warning)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
             scheduler.step()
         
         avg_train_loss = epoch_train_loss / len(train_dataloader)
         writer.add_scalar('Training/Epoch_Loss', avg_train_loss, epoch)
-        writer.add_scalar('Training/Learning_Rate_Head', optimizer.param_groups[1]['lr'], epoch)
+        writer.add_scalar('Training/Learning_Rate_Head', optimizer.param_groups[0]['lr'], epoch)
         
         if (epoch + 1) % VAL_INTERVAL == 0 or (epoch + 1) == epochs:
-            from utils.validate import validate_model
             avg_val_loss, avg_score = validate_model(model, val_dataloader, criterion, encoder, device)
             
             writer.add_scalar('Validation/Loss', avg_val_loss, epoch)
@@ -227,8 +203,6 @@ def train_model(args):
                 
         else:
             print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Validation Skipped")
-
-        torch.cuda.empty_cache()
 
     writer.close()
 

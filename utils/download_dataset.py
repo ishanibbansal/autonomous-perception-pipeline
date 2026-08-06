@@ -61,8 +61,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Configuration 
-    TARGET_TRAIN_FILES = 10
-    TARGET_VAL_FILES = 4
+    TARGET_TRAIN_FILES = 25
+    TARGET_VAL_FILES = 5
     
     # Updated to use the correct individual_files structure
     TRAIN_BUCKET = "gs://waymo_open_dataset_v_1_4_3/individual_files/training/"
