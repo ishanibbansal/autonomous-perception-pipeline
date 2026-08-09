@@ -19,7 +19,6 @@ data/
 *.bag
 
 # Model Checkpoints & Weights
-models/
 *.pth
 *.pt
 *.onnx

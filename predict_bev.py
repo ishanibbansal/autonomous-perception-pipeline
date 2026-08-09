@@ -7,13 +7,11 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from torch.utils.data import DataLoader, ConcatDataset
 
-from model import WaymoBEVDetector 
-from utils.dataset import WaymoDataset
-from utils.target_encoder import BEVGridEncoder
-from utils.validate import validate_model
-from loss import BEVFocalLoss, CombinedBEVLoss
+from src.perception.models.teacher_bev import WaymoBEVDetector
+from src.perception.utils.dataset import WaymoDataset, waymo_collate_fn
+from src.perception.utils.target_encoder import BEVGridEncoder
 
-def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jpg', threshold=0.0):
+def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jpg'):
     """
     Renders a side-by-side comparison using TensorBoard-style min-max auto-scaling 
     so low-magnitude probability patterns become clearly visible.
@@ -29,7 +27,7 @@ def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jp
         scaled_pred = np.zeros_like(pred_np)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6), facecolor='#1E1E1E')
-    fig.suptitle("WaymoBEVDetector: Model Prediction vs Ground Truth", color='white', fontsize=14, fontweight='bold')
+    fig.suptitle("Teacher Model: Prediction vs Ground Truth", color='white', fontsize=14, fontweight='bold')
 
     # Panel 1: Auto-scaled Model Prediction Heatmap
     im0 = axes[0].imshow(scaled_pred, cmap='magma', vmin=0.0, vmax=1.0)
@@ -50,51 +48,21 @@ def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jp
     plt.close(fig)
     print(f"Saved side-by-side BEV comparison map to {output_path}")
 
-def custom_collate_fn(batch):
-    return {
-        'timestamp': torch.stack([item['timestamp'] for item in batch]),
-        'front_image': torch.stack([item['front_image'] for item in batch]),
-        'bboxes': torch.stack([item['bboxes'] for item in batch]),
-        'num_valid_boxes': torch.stack([item['num_valid_boxes'] for item in batch]),
-        'lidar_points': [item['lidar_points'] for item in batch]
-    }
 
-def run_validation_prediction(checkpoint_path='best_waymo_bev_checkpoint.pt', output_path='prediction_bev.jpg', bev_threshold=0.004, frame_index=None):
-    print(f"Loading model from {checkpoint_path}...")
+def run_validation_prediction(checkpoint_path='best_waymo_bev_checkpoint.pt', output_path='prediction_output.jpg', frame_index=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Loading model from {checkpoint_path} onto {device}...")
     
-    model = WaymoBEVDetector() 
+    model = WaymoBEVDetector().to(device)
     
     if not os.path.exists(checkpoint_path):
         print(f"Error: Checkpoint not found at {checkpoint_path}")
         return
         
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # --- RESTORE EMA WEIGHTS & BATCHNORM STATS ---
-    base_state = checkpoint.get('model_state_dict', {})
-    ema_state = checkpoint.get('ema_model_state_dict', {})
-    
-    if ema_state:
-        print("Injecting healthy BatchNorm running statistics from base model into EMA...")
-        for key, value in base_state.items():
-            if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
-                ema_key = 'module.' + key 
-                if ema_key in ema_state:
-                    ema_state[ema_key] = value
-        state_dict = ema_state
-    else:
-        state_dict = base_state if base_state else checkpoint
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"Successfully loaded Teacher model from Epoch {checkpoint.get('epoch', 'N/A')}")
 
-    clean_state_dict = {}
-    for k, v in state_dict.items():
-        new_key = k[7:] if k.startswith('module.') else k
-        clean_state_dict[new_key] = v
-        
-    missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
-    print(f"Checkpoint Loaded | Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
-
-    model.to(device)
     model.eval()
     
     # --- SETUP VALIDATION DATASET ---
@@ -102,88 +70,85 @@ def run_validation_prediction(checkpoint_path='best_waymo_bev_checkpoint.pt', ou
     if not val_files:
         raise FileNotFoundError("No .tfrecord files found in data/raw/val/")
 
-    val_datasets = [WaymoDataset(tfrecord_path=f) for f in val_files]
+    # Use num_sweeps=3 to match training conditions
+    val_datasets = [WaymoDataset(tfrecord_path=f, is_train=False, num_sweeps=3) for f in val_files]
     val_dataset = ConcatDataset(val_datasets)
     print(f"Total validation frames available: {len(val_dataset)}")
     
-    encoder = BEVGridEncoder(x_range=(0.0, 80.0), y_range=(-40.0, 40.0), resolution=0.5)
+    # Use exact same encoder settings as training
+    encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
 
-    # --- EXTRACT SPECIFIC FRAME OR SCAN FOR CENTER TRAFFIC ---
+    # Use batch_size 1 to easily extract a single pristine frame and point cloud
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=waymo_collate_fn)
+
+    target_batch = None
+    
     if frame_index is not None:
-        if frame_index >= len(val_dataset):
-            print(f"Error: Requested frame_index {frame_index} exceeds dataset size ({len(val_dataset)}).")
-            return
-        sample = val_dataset[frame_index]
-        target_batch = {
-            'front_image': sample['front_image'].unsqueeze(0),
-            'bboxes': sample['bboxes'].unsqueeze(0),
-            'num_valid_boxes': sample['num_valid_boxes'].unsqueeze(0)
-        }
-        print(f"Loaded requested Frame {frame_index} containing {sample['num_valid_boxes'].item()} ground truth vehicles.")
+        print(f"Fast-forwarding to requested Frame {frame_index}...")
+        for i, batch in enumerate(val_dataloader):
+            if i == frame_index:
+                target_batch = batch
+                break
     else:
         print(f"Scanning validation dataset for a 'center-lane traffic' frame...")
-        target_batch = None
-        val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True, collate_fn=custom_collate_fn)
-        
         for batch in val_dataloader:
-            for b_idx in range(batch['front_image'].shape[0]):
-                valid_boxes = batch['num_valid_boxes'][b_idx].item()
-                bboxes = batch['bboxes'][b_idx]
-                
-                # Count how many cars are directly in front of the ego vehicle (y between -1.5 and 1.5 meters)
-                center_cars = 0
-                for i in range(valid_boxes):
-                    y = bboxes[i, 4].item()
-                    x = bboxes[i, 3].item()
-                    # Filter for cars straight ahead in the ego-lane
-                    if abs(y) < 1.5 and x > 5.0:
-                        center_cars += 1
-                        
-                if center_cars >= 2: # Frame with at least 2 cars directly ahead
-                    target_batch = {
-                        'front_image': batch['front_image'][b_idx:b_idx+1],
-                        'bboxes': batch['bboxes'][b_idx:b_idx+1],
-                        'num_valid_boxes': batch['num_valid_boxes'][b_idx:b_idx+1]
-                    }
-                    print(f"Found ideal frame! Contains {valid_boxes} total vehicles, with {center_cars} directly in the center lane.")
-                    break
-            if target_batch is not None:
+            valid_boxes = batch['num_valid_boxes'][0].item()
+            bboxes = batch['bboxes'][0]
+            
+            center_cars = 0
+            for i in range(valid_boxes):
+                y = bboxes[i, 4].item()
+                x = bboxes[i, 3].item()
+                if abs(y) < 1.5 and x > 5.0:
+                    center_cars += 1
+                    
+            if center_cars >= 2:
+                target_batch = batch
+                print(f"Found ideal frame! Contains {valid_boxes} total vehicles, with {center_cars} directly in the center lane.")
                 break
                 
         if target_batch is None:
-            print("Could not find a heavy center-lane frame. Defaulting to frame 0.")
-            sample = val_dataset[0]
-            target_batch = {
-                'front_image': sample['front_image'].unsqueeze(0),
-                'bboxes': sample['bboxes'].unsqueeze(0),
-                'num_valid_boxes': sample['num_valid_boxes'].unsqueeze(0)
-            }
+            print("Could not find a heavy center-lane frame. Defaulting to first frame.")
+            target_batch = next(iter(val_dataloader))
 
-    # Save debug camera view
-    rgb_np = target_batch['front_image'][0, :3].permute(1, 2, 0).numpy().astype(np.uint8)
+    # --- SAVE DEBUG CAMERA IMAGE ---
+    # The dataset returns float32 tensors scaled 0-1. Convert back to 0-255 uint8 for OpenCV
+    rgb_np = target_batch['camera_images'][0].permute(1, 2, 0).numpy()
+    rgb_np = (rgb_np * 255.0).astype(np.uint8)
     cv2.imwrite('debug_input_frame.jpg', cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
     print("Saved 'debug_input_frame.jpg' for visual verification.")
 
-    # Run forward pass for visualization
-    images = target_batch['front_image'].to(device, dtype=torch.float32)
+    # --- RUN INFERENCE ---
+    print("Running Teacher Model forward pass...")
+    
+    # Move everything to device
+    lidar_points = target_batch['lidar_points'].to(device)
+    batch_indices = target_batch['batch_indices'].to(device)
+    camera_images = target_batch['camera_images'].to(device)
+    lidar_uvs = target_batch['lidar_uvs'].to(device)
+    
+    # Encode ground truth
     targets_dict = encoder.encode(target_batch['bboxes'], target_batch['num_valid_boxes'])
     target_grid = targets_dict['bev_occupancy']
 
-    print("Running inference visualization...")
     with torch.no_grad(), torch.amp.autocast('cuda'):
-        predictions = model(images)
-        pred_prob = torch.sigmoid(predictions['bev_occupancy'])
+        # Pass all 4 required inputs to the Teacher Model
+        predictions = model(lidar_points, batch_indices, camera_images, lidar_uvs)
         
-        # --- HORIZONTAL FLIP FIX (Optional) ---
-        # Uncomment the line below to align the lateral coordinate systems 
-        # for vehicles that are outside the center lane.
-        # pred_prob = torch.flip(pred_prob, dims=[-1])
+        # --- NEW: Horizontally flip the Teacher's prediction to align with the camera frame ---
+        predictions['bev_occupancy'] = torch.flip(predictions['bev_occupancy'], dims=[-1])
+        
+        pred_prob = torch.sigmoid(predictions['bev_occupancy'])
         
     print(f"Peak prediction probability: {pred_prob.max().item():.4f}")
     
-    save_bev_side_by_side(pred_prob, target_grid, output_path=output_path, threshold=bev_threshold)
+    save_bev_side_by_side(pred_prob, target_grid, output_path=output_path)
+
 
 if __name__ == '__main__':
-    checkpoint_file = 'best_waymo_bev_checkpoint.pt'
-    # Set frame_index=None to trigger the center-lane traffic scanner
-    run_validation_prediction(checkpoint_path=checkpoint_file, output_path='prediction_output.jpg', frame_index=5)
+    # Set frame_index=None to let it auto-scan for traffic
+    run_validation_prediction(
+        checkpoint_path='best_waymo_bev_checkpoint.pt', 
+        output_path='prediction_output.jpg', 
+        frame_index=None
+    )

@@ -209,4 +209,7 @@ class WaymoBEVDetector(nn.Module):
         bev_features = self.point_pillar_encoder(fused_lidar_points, batch_indices) 
         predictions = self.bev_head(bev_features)
         
+        # --- FIX: Append the intermediate feature map for student distillation ---
+        predictions['bev_features'] = bev_features
+        
         return predictions

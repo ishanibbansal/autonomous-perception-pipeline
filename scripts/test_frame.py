@@ -1,6 +1,10 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import cv2
 import glob
-from utils.dataset import WaymoDataset
+from src.perception.utils.dataset import WaymoDataset
 
 def extract_first_frame():
     tf_files = glob.glob('data/raw/train/*.tfrecord') + glob.glob('data/raw/*.tfrecord')

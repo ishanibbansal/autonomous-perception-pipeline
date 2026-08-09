@@ -19,9 +19,6 @@ class WaymoDataset(Dataset):
         self.num_sweeps = num_sweeps 
         
         self._frame_cache = OrderedDict()
-        
-        # --- FIX 1: Drastically reduce cache capacity ---
-        # We only need enough history to satisfy num_sweeps, preventing massive RAM bloat.
         self._cache_capacity = max(self.num_sweeps + 2, 5)
         
         tf.config.set_visible_devices([], 'GPU')
@@ -89,13 +86,25 @@ class WaymoDataset(Dataset):
     def _extract_front_image(self, frame):
         for img in frame.images:
             if img.name == open_dataset.CameraName.FRONT:
-                # --- FIX 2: Use PIL instead of tf.io inside the dataloader worker ---
-                # This prevents TensorFlow memory allocators from leaking RAM in PyTorch sub-processes.
                 pil_img = Image.open(io.BytesIO(img.image))
                 decoded_img = np.array(pil_img)
                 img_tensor = (decoded_img.astype(np.float32) / 255.0).transpose(2, 0, 1)
                 return img_tensor
-        return np.zeros((3, 640, 960), dtype=np.float32)
+        # [FIX]: Match the actual 1280x1920 Waymo resolution fallback
+        return np.zeros((3, 1280, 1920), dtype=np.float32)
+
+    def _extract_camera_params(self, frame):
+        for calib in frame.context.camera_calibrations:
+            if calib.name == open_dataset.CameraName.FRONT:
+                f_u, f_v, c_u, c_v = calib.intrinsic[:4]
+                intrinsics = np.array([
+                    [f_u, 0.0, c_u],
+                    [0.0, f_v, c_v],
+                    [0.0, 0.0, 1.0]
+                ], dtype=np.float32)
+                extrinsics = np.array(calib.extrinsic.transform, dtype=np.float32).reshape(4, 4)
+                return intrinsics, extrinsics
+        return np.eye(3, dtype=np.float32), np.eye(4, dtype=np.float32)
 
     def __getitem__(self, idx):
         current_frame = self._get_frame(idx)
@@ -103,6 +112,7 @@ class WaymoDataset(Dataset):
         current_pose = np.reshape(np.array(current_frame.pose.transform), [4, 4])
         
         front_image = self._extract_front_image(current_frame)
+        intrinsics, extrinsics = self._extract_camera_params(current_frame)
         
         all_points = []
         all_uvs = []
@@ -117,7 +127,6 @@ class WaymoDataset(Dataset):
             is_current = (sweep_idx == idx)
             
             lidar_points, lidar_uvs = self._extract_fusion_data(frame, is_current_frame=is_current)
-            
             if not is_current:
                 xyz = lidar_points[:, :3]
                 xyz_homogeneous = np.concatenate([xyz, np.ones((xyz.shape[0], 1))], axis=1)
@@ -134,6 +143,28 @@ class WaymoDataset(Dataset):
 
         fused_lidar_points = np.concatenate(all_points, axis=0)
         fused_lidar_uvs = np.concatenate(all_uvs, axis=0)
+
+        # [FIX]: Generate 80x120 Depth Labels
+        depth_label = np.full((80, 120), -1, dtype=np.int64) 
+        
+        # [FIX]: Use 1920 width / 1280 height boundaries
+        valid_mask = (fused_lidar_uvs[:, 0] >= 0) & (fused_lidar_uvs[:, 0] < 1920) & \
+                     (fused_lidar_uvs[:, 1] >= 0) & (fused_lidar_uvs[:, 1] < 1280) & \
+                     (fused_lidar_points[:, 0] >= 2.0) & (fused_lidar_points[:, 0] < 50.0)
+                     
+        if valid_mask.any():
+            v_uvs = fused_lidar_uvs[valid_mask]
+            v_depths = fused_lidar_points[valid_mask, 0]
+            
+            sort_idx = np.argsort(v_depths)[::-1]
+            v_uvs, v_depths = v_uvs[sort_idx], v_depths[sort_idx]
+            
+            # [FIX]: Clip to 119 and 79 max indices
+            u_feat = np.clip((v_uvs[:, 0] / 16.0).astype(np.int32), 0, 119)
+            v_feat = np.clip((v_uvs[:, 1] / 16.0).astype(np.int32), 0, 79)
+            
+            d_bins = np.clip(((v_depths - 2.0) / 1.0).astype(np.int64), 0, 47)
+            depth_label[v_feat, u_feat] = d_bins
                 
         bboxes = np.zeros((self.max_boxes, 10), dtype=np.float32)
         valid_idx = 0
@@ -157,21 +188,24 @@ class WaymoDataset(Dataset):
             bboxes[:valid_idx, 6:9] *= scale
             
             if random.random() > 0.5:
-                # 1. Flip 3D LiDAR & BBoxes
                 fused_lidar_points[:, 1] = -fused_lidar_points[:, 1] 
                 bboxes[:valid_idx, 4] = -bboxes[:valid_idx, 4]
                 bboxes[:valid_idx, 9] = -bboxes[:valid_idx, 9]
                 
-                # 2. Flip 2D Front Camera Image (Shape: [3, 640, 960])
                 front_image = np.ascontiguousarray(np.flip(front_image, axis=2))
-                
-                # 3. Reflect UV coordinates across image width (960px)
                 valid_uv_mask = fused_lidar_uvs[:, 0] != -9999.0
-                fused_lidar_uvs[valid_uv_mask, 0] = 960.0 - fused_lidar_uvs[valid_uv_mask, 0]
+                
+                # [FIX]: Invert horizontally across 1920 pixels
+                fused_lidar_uvs[valid_uv_mask, 0] = 1920.0 - fused_lidar_uvs[valid_uv_mask, 0]
+                intrinsics[0, 2] = 1920.0 - intrinsics[0, 2]
+                depth_label = np.ascontiguousarray(np.flip(depth_label, axis=1))
 
         return {
             'timestamp': torch.tensor(current_frame.timestamp_micros, dtype=torch.int64),
-            'camera_image': torch.from_numpy(front_image),
+            'camera_image': torch.from_numpy(front_image),       
+            'intrinsics': torch.from_numpy(intrinsics),          
+            'extrinsics': torch.from_numpy(extrinsics),           
+            'depth_label': torch.from_numpy(depth_label), 
             'bboxes': torch.from_numpy(bboxes),
             'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32),
             'lidar_points': torch.from_numpy(fused_lidar_points),
@@ -181,6 +215,9 @@ class WaymoDataset(Dataset):
 def waymo_collate_fn(batch):
     timestamps = []
     camera_images = []
+    intrinsics = []
+    extrinsics = []
+    depth_labels = []
     bboxes = []
     num_valid_boxes = []
     all_points = []
@@ -190,6 +227,9 @@ def waymo_collate_fn(batch):
     for i, item in enumerate(batch):
         timestamps.append(item['timestamp'])
         camera_images.append(item['camera_image'])
+        intrinsics.append(item['intrinsics']) 
+        extrinsics.append(item['extrinsics'])  
+        depth_labels.append(item['depth_label']) 
         bboxes.append(item['bboxes'])
         num_valid_boxes.append(item['num_valid_boxes'])
         
@@ -203,6 +243,9 @@ def waymo_collate_fn(batch):
     return {
         'timestamp': torch.stack(timestamps),
         'camera_images': torch.stack(camera_images),
+        'intrinsics': torch.stack(intrinsics), 
+        'extrinsics': torch.stack(extrinsics),  
+        'depth_labels': torch.stack(depth_labels), 
         'bboxes': torch.stack(bboxes),
         'num_valid_boxes': torch.stack(num_valid_boxes),
         'lidar_points': torch.cat(all_points, dim=0),

@@ -10,11 +10,11 @@ import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
-from model import WaymoBEVDetector
-from loss import WaymoDetectionLoss
-from utils.dataset import WaymoDataset, waymo_collate_fn
-from utils.target_encoder import BEVGridEncoder
-from utils.validate import validate_model
+from src.perception.models.teacher_bev import WaymoBEVDetector
+from src.perception.losses.centernet_loss import WaymoDetectionLoss
+from src.perception.utils.dataset import WaymoDataset, waymo_collate_fn
+from src.perception.utils.validate import validate_model
+from src.perception.utils.target_encoder import BEVGridEncoder
 
 def train_model(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -22,13 +22,13 @@ def train_model(args):
     
     torch.backends.cudnn.benchmark = True
 
-    writer = SummaryWriter(log_dir='runs/lidar_camera_teacher_01')
-    print("TensorBoard initialized. Run 'tensorboard --logdir=runs' to view.")
+    writer = SummaryWriter(log_dir=args.log_dir)
+    print(f"TensorBoard initialized. Run 'tensorboard --logdir={args.log_dir}' to view.")
 
     # --- Initialize Model ---
     model = WaymoBEVDetector().to(device)
 
-    # --- NEW: Initialize the Master Pipeline Loss ---
+    # --- Initialize the Master Pipeline Loss ---
     criterion = WaymoDetectionLoss().to(device)
     
     encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
@@ -55,7 +55,6 @@ def train_model(args):
     if not val_files:
         raise FileNotFoundError("No .tfrecord files found in data/raw/val/")
 
-    # Note: Adjust num_sweeps here if needed for CPU testing
     train_datasets = [WaymoDataset(tfrecord_path=f, is_train=True) for f in train_files]
     train_dataset = ConcatDataset(train_datasets)
     
@@ -75,17 +74,17 @@ def train_model(args):
     
     val_dataloader = DataLoader(
         val_dataset, 
-        batch_size=4,             # Bump back up to 4 to cut total batches in half
+        batch_size=4,
         shuffle=False, 
-        num_workers=2,            # Use 2 workers safely since validation has no gradients/backward pass
+        num_workers=2,
         pin_memory=True, 
         collate_fn=waymo_collate_fn,
         persistent_workers=True,
         prefetch_factor=2
     )
     
-    checkpoint_path = "waymo_bev_checkpoint.pt"
-    best_checkpoint_path = "best_waymo_bev_checkpoint.pt"
+    checkpoint_path = args.ckpt_name
+    best_checkpoint_path = args.best_ckpt_name
     best_val_score = 0.0
     start_epoch = 0
     VAL_INTERVAL = 3
@@ -123,14 +122,12 @@ def train_model(args):
             camera_images = batch['camera_images'].to(device, non_blocking=True)
             lidar_uvs = batch['lidar_uvs'].to(device, non_blocking=True)
             
-            # --- Move Encoded Targets to Device Safely ---
             encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
             targets_gpu = {k: v.to(device, non_blocking=True) for k, v in encoded_targets.items()}
             
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 predictions = model(lidar_points, batch_indices, camera_images, lidar_uvs)
                 
-                # --- The Master Loss Wrapper applies automatically ---
                 total_loss = criterion(predictions, targets_gpu)
                 loss = total_loss / ACCUMULATION_STEPS
             
@@ -207,8 +204,11 @@ def train_model(args):
     writer.close()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train Waymo BEV Detector')
+    parser = argparse.ArgumentParser(description='Train Teacher BEV Detector')
     parser.add_argument('--resume', action='store_true', help='Resume training from best checkpoint')
+    parser.add_argument('--log_dir', type=str, default='runs/lidar_camera_teacher_01', help='TensorBoard log directory')
+    parser.add_argument('--ckpt_name', type=str, default='waymo_bev_checkpoint.pt', help='Standard checkpoint name')
+    parser.add_argument('--best_ckpt_name', type=str, default='best_waymo_bev_checkpoint.pt', help='Best checkpoint name')
     args = parser.parse_args()
     
     mp.set_start_method('spawn', force=True)
