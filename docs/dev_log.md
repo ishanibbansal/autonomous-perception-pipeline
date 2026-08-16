@@ -40,3 +40,20 @@
   1. Restored the strict physical FOV filter (`x > 2.0 and abs(y / x) < 0.6`) in `dataset.py` and implemented a spatial FOV mask in `distill_loss.py` to strictly evaluate the Student inside the physical camera cone.
   2. Slashed `alpha_depth` to `0.1` to un-choke the bounding box detection gradients.
   3. Added a `prior_prob = 0.01` bias initialization to the final occupancy head to establish a 99% empty road baseline before training starts.
+
+### Log 3.12: Edge Deployment: ONNX Export, TensorRT Engine Acceleration & ROS 2 C++ Node Integration
+* **Date:** August 15, 2026
+* **Objective:** Transition the trained PyTorch Monocular Student network into a production-grade, real-time C++ inference pipeline using TensorRT and ROS 2.
+* **Challenges & Solutions:**
+  1. **Dynamic Shapes & Plugin Deserialization in TensorRT 11:** 
+     * *Symptom:* Initial ONNX conversions failed during engine deserialization in C++ with `API Usage Error (Cannot find plugin: ScatterElements, version: 2)`.
+     * *Root Cause:* Dynamic shape tracing introduced runtime graph uncertainty, and TensorRT 11 encapsulates `ScatterElements` inside `libnvinfer_plugin.so.11`.
+     * *Fix:* Wrapped the model forward pass in `BEVExportWrapper` with fixed Waymo projection matrices to freeze static tensor shapes (`1x3x1280x1920` image, `1x3x3` intrinsics, `1x4x4` extrinsics). Linked `/usr/lib/x86_64-linux-gnu/libnvinfer_plugin.so.11` in CMake and forward-declared `initLibNvInferPlugins()` to initialize plugin registries prior to engine deserialization.
+  2. **Preprocessing Distribution Mismatch:** 
+     * *Symptom:* Initial C++ inference output produced a uniform, high-confidence magenta block of false positives across the entire BEV grid.
+     * *Root Cause:* The C++ pipeline applied standard ImageNet normalization (mean/std subtraction), whereas the PyTorch training pipeline consumed raw `[0.0, 1.0]` RGB floats.
+     * *Fix:* Removed ImageNet normalization from `student_bev_node.cpp`, feeding pristine `[0, 1]` floats directly into CUDA device buffers.
+  3. **Spatial Coordinate System Alignment:** 
+     * *Symptom:* Predicted occupancy clusters appeared inverted along the vertical axis.
+     * *Root Cause:* OpenCV renders matrices with origin at the top-left, whereas PyTorch BEV target grids anchor $(X=0, Y=0)$ at the bottom.
+     * *Fix:* Applied vertical inversion (`cv::flip(heatmap, heatmap, 0)`) before colormap mapping and generated a side-by-side stitched frame (`cv::hconcat`) combining the camera perspective with the 3D BEV occupancy heatmap.

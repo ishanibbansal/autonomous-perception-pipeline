@@ -20,7 +20,7 @@ find_package(CUDAToolkit REQUIRED)
 # Add Executable
 add_executable(bev_node src/student_bev_node.cpp)
 
-# Include directories (Standard CMake bypass)
+# Include directories
 target_include_directories(bev_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -30,9 +30,10 @@ target_include_directories(bev_node PUBLIC
   ${cv_bridge_INCLUDE_DIRS}
 )
 
-# Link TensorRT, CUDA, OpenCV, and ROS 2
+# Link Core TensorRT, Absolute Plugin Library Path, CUDA, OpenCV, and ROS 2
 target_link_libraries(bev_node
   nvinfer
+  /usr/lib/x86_64-linux-gnu/libnvinfer_plugin.so.11
   CUDA::cudart
   ${OpenCV_LIBS}
   ${rclcpp_LIBRARIES}
