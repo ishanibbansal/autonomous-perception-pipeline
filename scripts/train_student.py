@@ -1,4 +1,9 @@
 import os
+import sys
+
+# Inject root path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import glob
 import time
@@ -66,7 +71,6 @@ def train_student(args):
 
     student = StudentBEVDetector().to(device)
     
-    # Direct Distillation Transfer: Port Teacher's pre-trained BiFPN parameters
     student.bev_head.load_state_dict(teacher.bev_head.state_dict())
     
     criterion = CrossModalDistillationLoss(alpha_feat=0.1, alpha_depth=0.1).to(device)
@@ -75,12 +79,11 @@ def train_student(args):
     epochs = 15
     ACCUMULATION_STEPS = 8
     
-    # Differential learning rates
     optimizer = optim.AdamW([
         {'params': student.backbone_stem.parameters(), 'lr': 1e-5},
         {'params': student.reduce_channel.parameters(), 'lr': 1e-4},
-        {'params': student.view_transformer.parameters(), 'lr': 5e-4}, # Learn the projection fast
-        {'params': student.bev_head.parameters(), 'lr': 1e-5}          # Shield the pre-trained weights
+        {'params': student.view_transformer.parameters(), 'lr': 5e-4}, 
+        {'params': student.bev_head.parameters(), 'lr': 1e-5}          
     ], weight_decay=1e-4)                                            
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-8)
@@ -115,6 +118,10 @@ def train_student(args):
             
             intrinsics = batch['intrinsics'].to(device, non_blocking=True)
             extrinsics = batch['extrinsics'].to(device, non_blocking=True)
+            
+            # PRE-INVERT ON GPU BEFORE THE FORWARD PASS
+            extrinsics_inv = torch.inverse(extrinsics)
+            
             depth_labels = batch['depth_labels'].to(device, non_blocking=True)
             
             encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
@@ -126,11 +133,9 @@ def train_student(args):
                     
                     teacher_features = teacher_outputs.get('bev_features', None)
                     if teacher_features is not None:
-                        # Teacher's features are natively mirrored. We MUST flip them to match 
-                        # the properly aligned Student and Target Encoder.
                         teacher_features = torch.flip(teacher_features, dims=[-1])
 
-                student_outputs = student(camera_images, intrinsics, extrinsics)
+                student_outputs = student(camera_images, intrinsics, extrinsics_inv)
                 
                 total_loss, loss_dict = criterion(
                     student_outputs, 

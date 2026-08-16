@@ -1,5 +1,8 @@
+import sys
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import glob
 import time
 import argparse

@@ -34,13 +34,13 @@ class LiftSplatViewTransformer(nn.Module):
         frustum = torch.stack((w_grid, h_grid, d_grid), dim=-1)
         return frustum
         
-    def get_geometry(self, intrinsics, extrinsics):
+    def get_geometry(self, intrinsics, extrinsics_inv):
         B = intrinsics.shape[0]
         
         # Bypass PyTorch FP16 matrix instability using closed-form algebra in FP32
         with torch.autocast('cuda', enabled=False):
             intrinsics = intrinsics.float()
-            extrinsics = extrinsics.float()
+            extrinsics_inv = extrinsics_inv.float()
             points = self.frustum.float().unsqueeze(0).expand(B, -1, -1, -1, -1) 
             
             u = points[..., 0]
@@ -63,10 +63,8 @@ class LiftSplatViewTransformer(nn.Module):
             cam_coords_waymo = torch.stack([X_w, Y_w, Z_w], dim=-1)
             cam_coords_hom = torch.cat((cam_coords_waymo, torch.ones_like(cam_coords_waymo[..., :1])), dim=-1)
             
-            # The Waymo Extrinsic matrix natively maps Vehicle-to-Camera (V2C)
-            # We must invert it to map Camera-to-Vehicle (C2V) for BEV projection
-            extrinsics_inv = torch.inverse(extrinsics).view(B, 1, 1, 1, 4, 4)
-            veh_coords_hom = (extrinsics_inv @ cam_coords_hom.unsqueeze(-1)).squeeze(-1)
+            extrinsics_inv_reshaped = extrinsics_inv.view(B, 1, 1, 1, 4, 4)
+            veh_coords_hom = (extrinsics_inv_reshaped @ cam_coords_hom.unsqueeze(-1)).squeeze(-1)
             
         return veh_coords_hom[..., :3] 
         
@@ -74,7 +72,7 @@ class LiftSplatViewTransformer(nn.Module):
         B, D, H, W, C = volume.shape
         
         geom = geom.reshape(B, -1, 3)
-        volume = volume.float().reshape(B, -1, C) # Cast to float32 to prevent scatter_add_ overflow
+        volume = volume.float().reshape(B, -1, C) 
         
         x_idx = ((geom[..., 0] - self.x_min) / self.x_step).long()
         y_idx = ((geom[..., 1] - self.y_min) / self.y_step).long()
@@ -102,7 +100,7 @@ class LiftSplatViewTransformer(nn.Module):
             
         return torch.stack(bev_maps, dim=0)
         
-    def forward(self, x, intrinsics, extrinsics):
+    def forward(self, x, intrinsics, extrinsics_inv):
         x = self.depth_net(x)
         depth_logits = x[:, :self.d_bins]
         depth = depth_logits.softmax(dim=1) 
@@ -111,7 +109,7 @@ class LiftSplatViewTransformer(nn.Module):
         volume = depth.unsqueeze(2) * context.unsqueeze(1) 
         volume = volume.permute(0, 1, 3, 4, 2)             
         
-        geom = self.get_geometry(intrinsics, extrinsics)
+        geom = self.get_geometry(intrinsics, extrinsics_inv)
         bev_features = self.voxel_pooling(geom, volume)
         
         return bev_features, depth_logits
@@ -134,13 +132,12 @@ class StudentBEVDetector(nn.Module):
             in_channels=256, out_channels=feature_channels, bev_h=bev_h, bev_w=bev_w
         )
         
-        # Student utilizes the Teacher's BiFPN capacity
         self.bev_head = BiFPNBEVDecoder(in_channels=feature_channels)
 
-    def forward(self, camera_images, intrinsics, extrinsics):
+    def forward(self, camera_images, intrinsics, extrinsics_inv):
         x = self.backbone_stem(camera_images)
         x = self.reduce_channel(x)
-        bev_features, depth_logits = self.view_transformer(x, intrinsics, extrinsics)
+        bev_features, depth_logits = self.view_transformer(x, intrinsics, extrinsics_inv)
         
         head_outputs = self.bev_head(bev_features)
         

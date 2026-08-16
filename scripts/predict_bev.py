@@ -1,7 +1,10 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import cv2
 import numpy as np
-import os
 import glob
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
