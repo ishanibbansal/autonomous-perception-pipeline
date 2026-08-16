@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from torchvision.models import ResNet50_Weights
+import math
+
+from src.perception.models.teacher_bev import BiFPNBEVDecoder 
 
 class LiftSplatViewTransformer(nn.Module):
     def __init__(self, in_channels=256, out_channels=64, bev_h=160, bev_w=160, 
@@ -20,8 +23,6 @@ class LiftSplatViewTransformer(nn.Module):
         self.y_step = (self.y_max - self.y_min) / self.bev_w
         
         self.depth_net = nn.Conv2d(in_channels, d_bins + out_channels, kernel_size=1)
-        
-        # [FIX]: Initialize frustum for 80x120 feature map (1/16th of 1280x1920)
         self.register_buffer('frustum', self._create_frustum(80, 120, 1280, 1920))
         
     def _create_frustum(self, feat_h, feat_w, image_h, image_w):
@@ -35,31 +36,52 @@ class LiftSplatViewTransformer(nn.Module):
         
     def get_geometry(self, intrinsics, extrinsics):
         B = intrinsics.shape[0]
-        points = self.frustum.unsqueeze(0).expand(B, -1, -1, -1, -1) 
         
-        d = points[..., 2:3]
-        uv = points[..., 0:2] * d
-        uvd = torch.cat((uv, d), dim=-1)
-        
-        # [FIX]: Safely align 3x3 and 4x4 matrices with the 5D frustum tensor
-        intrinsics_inv = torch.inverse(intrinsics).view(B, 1, 1, 1, 3, 3)
-        extrinsics_v = extrinsics.view(B, 1, 1, 1, 4, 4)
-        
-        cam_coords = (intrinsics_inv @ uvd.unsqueeze(-1)).squeeze(-1)
-        cam_coords_hom = torch.cat((cam_coords, torch.ones_like(cam_coords[..., :1])), dim=-1)
-        veh_coords_hom = (extrinsics_v @ cam_coords_hom.unsqueeze(-1)).squeeze(-1)
-        
+        # Bypass PyTorch FP16 matrix instability using closed-form algebra in FP32
+        with torch.autocast('cuda', enabled=False):
+            intrinsics = intrinsics.float()
+            extrinsics = extrinsics.float()
+            points = self.frustum.float().unsqueeze(0).expand(B, -1, -1, -1, -1) 
+            
+            u = points[..., 0]
+            v = points[..., 1]
+            d = points[..., 2]
+            
+            f_u = torch.clamp(intrinsics[:, 0, 0].view(B, 1, 1, 1), min=1e-5)
+            f_v = torch.clamp(intrinsics[:, 1, 1].view(B, 1, 1, 1), min=1e-5)
+            c_u = intrinsics[:, 0, 2].view(B, 1, 1, 1)
+            c_v = intrinsics[:, 1, 2].view(B, 1, 1, 1)
+            
+            X_cv = (u - c_u) * d / f_u
+            Y_cv = (v - c_v) * d / f_v
+            Z_cv = d
+            
+            X_w = Z_cv
+            Y_w = -X_cv
+            Z_w = -Y_cv
+            
+            cam_coords_waymo = torch.stack([X_w, Y_w, Z_w], dim=-1)
+            cam_coords_hom = torch.cat((cam_coords_waymo, torch.ones_like(cam_coords_waymo[..., :1])), dim=-1)
+            
+            # The Waymo Extrinsic matrix natively maps Vehicle-to-Camera (V2C)
+            # We must invert it to map Camera-to-Vehicle (C2V) for BEV projection
+            extrinsics_inv = torch.inverse(extrinsics).view(B, 1, 1, 1, 4, 4)
+            veh_coords_hom = (extrinsics_inv @ cam_coords_hom.unsqueeze(-1)).squeeze(-1)
+            
         return veh_coords_hom[..., :3] 
         
     def voxel_pooling(self, geom, volume):
         B, D, H, W, C = volume.shape
         
-        # [FIX]: Use reshape instead of view to prevent permuted memory crashes
         geom = geom.reshape(B, -1, 3)
-        volume = volume.reshape(B, -1, C)
+        volume = volume.float().reshape(B, -1, C) # Cast to float32 to prevent scatter_add_ overflow
         
         x_idx = ((geom[..., 0] - self.x_min) / self.x_step).long()
         y_idx = ((geom[..., 1] - self.y_min) / self.y_step).long()
+        
+        # Force exact spatial alignment with the Target Encoder's (Top, Left) layout
+        x_idx = (self.bev_h - 1) - x_idx
+        y_idx = (self.bev_w - 1) - y_idx
         
         valid_mask = (x_idx >= 0) & (x_idx < self.bev_h) & \
                      (y_idx >= 0) & (y_idx < self.bev_w) & \
@@ -94,51 +116,38 @@ class LiftSplatViewTransformer(nn.Module):
         
         return bev_features, depth_logits
 
-
 class StudentBEVDetector(nn.Module):
     def __init__(self, bev_h=160, bev_w=160, feature_channels=64):
         super().__init__()
         
         resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
         self.backbone_stem = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool,
-            resnet.layer1,
-            resnet.layer2,
-            resnet.layer3
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+            resnet.layer1, resnet.layer2, resnet.layer3
         ) 
-        
         self.reduce_channel = nn.Sequential(
             nn.Conv2d(1024, 256, kernel_size=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
-        
         self.view_transformer = LiftSplatViewTransformer(
-            in_channels=256, 
-            out_channels=feature_channels,
-            bev_h=bev_h,
-            bev_w=bev_w
+            in_channels=256, out_channels=feature_channels, bev_h=bev_h, bev_w=bev_w
         )
         
-        self.bev_head = nn.Sequential(
-            nn.Conv2d(feature_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=1)
-        )
+        # Student utilizes the Teacher's BiFPN capacity
+        self.bev_head = BiFPNBEVDecoder(in_channels=feature_channels)
 
     def forward(self, camera_images, intrinsics, extrinsics):
         x = self.backbone_stem(camera_images)
         x = self.reduce_channel(x)
-        
         bev_features, depth_logits = self.view_transformer(x, intrinsics, extrinsics)
-        bev_occupancy = self.bev_head(bev_features)
         
-        return {
+        head_outputs = self.bev_head(bev_features)
+        
+        out = {
             'bev_features': bev_features,
-            'bev_occupancy': bev_occupancy,
             'depth_logits': depth_logits
         }
+        out.update(head_outputs)
+        
+        return out

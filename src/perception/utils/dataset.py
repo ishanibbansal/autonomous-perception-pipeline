@@ -19,7 +19,7 @@ class WaymoDataset(Dataset):
         self.num_sweeps = num_sweeps 
         
         self._frame_cache = OrderedDict()
-        self._cache_capacity = max(self.num_sweeps + 2, 5)
+        self._cache_capacity = self.num_sweeps + 1
         
         tf.config.set_visible_devices([], 'GPU')
         self.record_offsets = self._index_tfrecord(self.tfrecord_path)
@@ -176,7 +176,7 @@ class WaymoDataset(Dataset):
             l, w, h = label.box.length, label.box.width, label.box.height
             heading = label.box.heading
             
-            if x > 0.0:
+            if x > 2.0 and abs(y / x) < 0.6:
                 box_array = np.array([label.type, 0.0, 0.0, x, y, z, l, w, h, heading], dtype=np.float32)
                 bboxes[valid_idx] = box_array
                 valid_idx += 1

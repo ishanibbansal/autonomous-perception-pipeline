@@ -20,3 +20,23 @@
 * **Solution:** 
   1. Replaced all `.view()` calls during voxel pooling with `.reshape()`, which safely handles non-contiguous permuted tensors.
   2. Stripped all $640 \times 960$ hardcodes. Expanded the frustum to exactly match the native $80 \times 120$ feature map output. Updated the dataset horizontal flip augmentations to invert across $1920.0$ pixels instead of $960.0$.
+
+### Log 3.10: Geometric Contradictions and The Mirrored Teacher
+* **Date:** August 12, 2026
+* **Symptom:** The distillation model was completely stuck at a 0.0510 validation IoU, then crashed into a "Confidence Valley" of 0.0001, performing significantly worse than a pure monocular baseline.
+* **Root Cause:** Two massive spatial alignment failures shattered the coordinate space:
+  1. **The Upside-Down Projector:** The Student's Lift-Splat-Shoot `voxel_pooling` mapped +X to the bottom of the grid and +Y to the right, physically projecting vehicles upside-down and backward relative to the `TargetEncoder` (which maps +X to Top and +Y to Left).
+  2. **The Mirrored Teacher:** The Teacher's PointPillar logic inverted the X-axis but skipped the Y-axis inversion, resulting in horizontally mirrored feature maps.
+* **Solution:** Mathematically inverted the X and Y indices (`159 - x_idx`, `159 - y_idx`) within the Student's `voxel_pooling` logic to perfectly match the target grid origin. Restored a horizontal `torch.flip(..., dims=[-1])` to the Teacher's intermediate feature maps in both `train_student.py` and `validate.py` to synchronize the distillation coordinate space.
+
+### Log 3.11: The "Telepathy" Penalty and Loss Bottlenecks
+* **Date:** August 12, 2026
+* **Symptom:** Even after fixing the geometry, the validation score crept up at a microscopic rate (0.0002 per epoch), and the detection Dice loss was severely plateaued near 0.99.
+* **Root Cause:** 
+  1. **The Telepathy Penalty:** The distillation `dataset.py` lacked the physical camera FOV filter. It was mapping *all* 360-degree LiDAR vehicles onto the target grid, violently punishing the monocular Student for failing to detect invisible cars in its physical blind spots.
+  2. **Loss Bullying:** The auxiliary depth loss (`alpha_depth=1.0`) was swinging wildly, completely drowning out the tiny focal gradients required to actually predict bounding boxes.
+  3. **Zero-Safe Strategy:** The Student lacked a background prior bias, causing it to take massive early focal penalties and default to predicting 0 everywhere.
+* **Solution:** 
+  1. Restored the strict physical FOV filter (`x > 2.0 and abs(y / x) < 0.6`) in `dataset.py` and implemented a spatial FOV mask in `distill_loss.py` to strictly evaluate the Student inside the physical camera cone.
+  2. Slashed `alpha_depth` to `0.1` to un-choke the bounding box detection gradients.
+  3. Added a `prior_prob = 0.01` bias initialization to the final occupancy head to establish a 99% empty road baseline before training starts.

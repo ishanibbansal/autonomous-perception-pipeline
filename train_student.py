@@ -22,38 +22,33 @@ def train_student(args):
     print(f"Initializing Student Cross-Modal Distillation Training on: {device}")
     
     torch.backends.cudnn.benchmark = True
-
     writer = SummaryWriter(log_dir=args.log_dir)
 
     train_files = glob.glob('data/raw/train/*.tfrecord')
     val_files = glob.glob('data/raw/val/*.tfrecord')
 
-    train_datasets = [WaymoDataset(tfrecord_path=f, is_train=True) for f in train_files]
-    train_dataset = ConcatDataset(train_datasets)
-    
+    train_dataset = ConcatDataset([WaymoDataset(tfrecord_path=f, is_train=True) for f in train_files])
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=2, 
         shuffle=True, 
-        num_workers=4,           
+        num_workers=8,           
         pin_memory=True, 
-        collate_fn=waymo_collate_fn,
-        persistent_workers=True,     
-        prefetch_factor=2            
+        collate_fn=waymo_collate_fn, 
+        persistent_workers=True, 
+        prefetch_factor=1
     )
     
-    val_datasets = [WaymoDataset(tfrecord_path=f, is_train=False) for f in val_files]
-    val_dataset = ConcatDataset(val_datasets)
-    
+    val_dataset = ConcatDataset([WaymoDataset(tfrecord_path=f, is_train=False) for f in val_files])
     val_dataloader = DataLoader(
         val_dataset, 
         batch_size=2, 
         shuffle=False, 
         num_workers=4,            
         pin_memory=True, 
-        collate_fn=waymo_collate_fn,
-        persistent_workers=True,
-        prefetch_factor=2
+        collate_fn=waymo_collate_fn, 
+        persistent_workers=True, 
+        prefetch_factor=1
     )
 
     teacher = WaymoBEVDetector().to(device)
@@ -70,19 +65,25 @@ def train_student(args):
         param.requires_grad = False
 
     student = StudentBEVDetector().to(device)
-    criterion = CrossModalDistillationLoss(alpha_feat=2.0, alpha_depth=1.0).to(device)
+    
+    # Direct Distillation Transfer: Port Teacher's pre-trained BiFPN parameters
+    student.bev_head.load_state_dict(teacher.bev_head.state_dict())
+    
+    criterion = CrossModalDistillationLoss(alpha_feat=0.1, alpha_depth=0.1).to(device)
     encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
     
     epochs = 15
     ACCUMULATION_STEPS = 8
     
-    optimizer = optim.AdamW(student.parameters(), lr=1e-4, weight_decay=1e-4)                                               
+    # Differential learning rates
+    optimizer = optim.AdamW([
+        {'params': student.backbone_stem.parameters(), 'lr': 1e-5},
+        {'params': student.reduce_channel.parameters(), 'lr': 1e-4},
+        {'params': student.view_transformer.parameters(), 'lr': 5e-4}, # Learn the projection fast
+        {'params': student.bev_head.parameters(), 'lr': 1e-5}          # Shield the pre-trained weights
+    ], weight_decay=1e-4)                                            
     
-    warmup_epochs = 2
-    warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-8)
-    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
-    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-8)
     scaler = torch.amp.GradScaler('cuda')
 
     checkpoint_path = args.ckpt_name
@@ -122,10 +123,12 @@ def train_student(args):
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 with torch.no_grad():
                     teacher_outputs = teacher(lidar_points, batch_indices, camera_images, lidar_uvs)
-                    teacher_outputs['bev_occupancy'] = torch.flip(teacher_outputs['bev_occupancy'], dims=[-1])
-                    if 'bev_features' in teacher_outputs:
-                        teacher_outputs['bev_features'] = torch.flip(teacher_outputs['bev_features'], dims=[-1])
+                    
                     teacher_features = teacher_outputs.get('bev_features', None)
+                    if teacher_features is not None:
+                        # Teacher's features are natively mirrored. We MUST flip them to match 
+                        # the properly aligned Student and Target Encoder.
+                        teacher_features = torch.flip(teacher_features, dims=[-1])
 
                 student_outputs = student(camera_images, intrinsics, extrinsics)
                 
@@ -180,9 +183,15 @@ def train_student(args):
                 'scaler_state_dict': scaler.state_dict(),
                 'val_score': val_score,
             }
+            
+            if (epoch + 1) % 5 == 0:
+                torch.save(checkpoint, checkpoint_path)
+                print(f"--> Saved periodic checkpoint at epoch {epoch + 1} to {checkpoint_path}")
+                
             if val_score > best_val_score:
                 best_val_score = val_score
                 torch.save(checkpoint, best_checkpoint_path)
+                print(f"--> [NEW BEST] Saved peak model with Val Score: {val_score:.4f} to {best_checkpoint_path}")
 
     writer.close()
 

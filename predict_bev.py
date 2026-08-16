@@ -19,7 +19,6 @@ def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jp
     pred_np = np.squeeze(pred_prob.detach().cpu().numpy())
     target_np = np.squeeze(target_grid.detach().cpu().numpy())
 
-    # --- TENSORBOARD-STYLE AUTO-SCALING ---
     p_min, p_max = pred_np.min(), pred_np.max()
     if p_max > p_min:
         scaled_pred = (pred_np - p_min) / (p_max - p_min)
@@ -29,7 +28,6 @@ def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jp
     fig, axes = plt.subplots(1, 2, figsize=(12, 6), facecolor='#1E1E1E')
     fig.suptitle("Teacher Model: Prediction vs Ground Truth", color='white', fontsize=14, fontweight='bold')
 
-    # Panel 1: Auto-scaled Model Prediction Heatmap
     im0 = axes[0].imshow(scaled_pred, cmap='magma', vmin=0.0, vmax=1.0)
     axes[0].set_title(f"Model Prediction (Auto-Scaled | Raw Peak: {p_max:.4f})", color='white', fontsize=11)
     axes[0].axis('off')
@@ -37,7 +35,6 @@ def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jp
     cbar0.ax.yaxis.set_tick_params(color='white')
     plt.setp(plt.getp(cbar0.ax, 'yticklabels'), color='white')
 
-    # Panel 2: Ground Truth BEV Grid
     neon_cmap = ListedColormap(['black', '#00FFCC'])
     axes[1].imshow(target_np, cmap=neon_cmap, interpolation='nearest')
     axes[1].set_title("Ground Truth BEV Raster", color='white', fontsize=11)
@@ -47,7 +44,6 @@ def save_bev_side_by_side(pred_prob, target_grid, output_path='prediction_bev.jp
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"Saved side-by-side BEV comparison map to {output_path}")
-
 
 def run_validation_prediction(checkpoint_path='best_waymo_bev_checkpoint.pt', output_path='prediction_output.jpg', frame_index=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -65,24 +61,18 @@ def run_validation_prediction(checkpoint_path='best_waymo_bev_checkpoint.pt', ou
 
     model.eval()
     
-    # --- SETUP VALIDATION DATASET ---
     val_files = glob.glob('data/raw/val/*.tfrecord')
     if not val_files:
         raise FileNotFoundError("No .tfrecord files found in data/raw/val/")
 
-    # Use num_sweeps=3 to match training conditions
     val_datasets = [WaymoDataset(tfrecord_path=f, is_train=False, num_sweeps=3) for f in val_files]
     val_dataset = ConcatDataset(val_datasets)
     print(f"Total validation frames available: {len(val_dataset)}")
     
-    # Use exact same encoder settings as training
     encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
-
-    # Use batch_size 1 to easily extract a single pristine frame and point cloud
     val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=waymo_collate_fn)
 
     target_batch = None
-    
     if frame_index is not None:
         print(f"Fast-forwarding to requested Frame {frame_index}...")
         for i, batch in enumerate(val_dataloader):
@@ -111,42 +101,32 @@ def run_validation_prediction(checkpoint_path='best_waymo_bev_checkpoint.pt', ou
             print("Could not find a heavy center-lane frame. Defaulting to first frame.")
             target_batch = next(iter(val_dataloader))
 
-    # --- SAVE DEBUG CAMERA IMAGE ---
-    # The dataset returns float32 tensors scaled 0-1. Convert back to 0-255 uint8 for OpenCV
     rgb_np = target_batch['camera_images'][0].permute(1, 2, 0).numpy()
     rgb_np = (rgb_np * 255.0).astype(np.uint8)
     cv2.imwrite('debug_input_frame.jpg', cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
     print("Saved 'debug_input_frame.jpg' for visual verification.")
 
-    # --- RUN INFERENCE ---
     print("Running Teacher Model forward pass...")
     
-    # Move everything to device
     lidar_points = target_batch['lidar_points'].to(device)
     batch_indices = target_batch['batch_indices'].to(device)
     camera_images = target_batch['camera_images'].to(device)
     lidar_uvs = target_batch['lidar_uvs'].to(device)
     
-    # Encode ground truth
     targets_dict = encoder.encode(target_batch['bboxes'], target_batch['num_valid_boxes'])
     target_grid = targets_dict['bev_occupancy']
 
     with torch.no_grad(), torch.amp.autocast('cuda'):
-        # Pass all 4 required inputs to the Teacher Model
         predictions = model(lidar_points, batch_indices, camera_images, lidar_uvs)
-        
-        # --- NEW: Horizontally flip the Teacher's prediction to align with the camera frame ---
-        predictions['bev_occupancy'] = torch.flip(predictions['bev_occupancy'], dims=[-1])
-        
         pred_prob = torch.sigmoid(predictions['bev_occupancy'])
         
+        # Apply the required horizontal mirror to evaluate properly aligned visualizations
+        pred_prob = torch.flip(pred_prob, dims=[-1])
+        
     print(f"Peak prediction probability: {pred_prob.max().item():.4f}")
-    
     save_bev_side_by_side(pred_prob, target_grid, output_path=output_path)
 
-
 if __name__ == '__main__':
-    # Set frame_index=None to let it auto-scan for traffic
     run_validation_prediction(
         checkpoint_path='best_waymo_bev_checkpoint.pt', 
         output_path='prediction_output.jpg', 
