@@ -1,5 +1,6 @@
 import os
 import sys
+import copy
 
 # Inject root path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -22,6 +23,25 @@ from src.perception.utils.dataset import WaymoDataset, waymo_collate_fn
 from src.perception.utils.validate import validate_student
 from src.perception.utils.target_encoder import BEVGridEncoder
 
+# --- NEW: Exponential Moving Average (EMA) Helper ---
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        self.decay = decay
+        for param in self.ema.parameters():
+            param.requires_grad = False
+
+    def update(self, model):
+        with torch.no_grad():
+            msd = model.state_dict()
+            esd = self.ema.state_dict()
+            for k in esd.keys():
+                if esd[k].dtype.is_floating_point:
+                    esd[k].mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+                else:
+                    esd[k].copy_(msd[k])
+
 def train_student(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Initializing Student Cross-Modal Distillation Training on: {device}")
@@ -37,11 +57,11 @@ def train_student(args):
         train_dataset, 
         batch_size=2, 
         shuffle=True, 
-        num_workers=8,           
+        num_workers=4,             # Reduced from 8 to fit in 16GB RAM
         pin_memory=True, 
         collate_fn=waymo_collate_fn, 
-        persistent_workers=True, 
-        prefetch_factor=1
+        persistent_workers=False,  # Clears worker memory leaks between epochs
+        prefetch_factor=2
     )
     
     val_dataset = ConcatDataset([WaymoDataset(tfrecord_path=f, is_train=False) for f in val_files])
@@ -49,11 +69,11 @@ def train_student(args):
         val_dataset, 
         batch_size=2, 
         shuffle=False, 
-        num_workers=4,            
+        num_workers=2,             # Reduced from 4
         pin_memory=True, 
         collate_fn=waymo_collate_fn, 
-        persistent_workers=True, 
-        prefetch_factor=1
+        persistent_workers=False,  # Clears memory after validation
+        prefetch_factor=2
     )
 
     teacher = WaymoBEVDetector().to(device)
@@ -71,20 +91,30 @@ def train_student(args):
 
     student = StudentBEVDetector().to(device)
     
+    # Load Teacher's head weights into Student, then keep the head unfrozen so it can adapt
     student.bev_head.load_state_dict(teacher.bev_head.state_dict())
+    for param in student.bev_head.parameters():
+        param.requires_grad = True
     
-    criterion = CrossModalDistillationLoss(alpha_feat=0.1, alpha_depth=0.1).to(device)
+    # Initialize EMA shadow model
+    ema_student = ModelEMA(student, decay=0.999)
+    
+    # Initialize criteria with soft logit distillation
+    criterion = CrossModalDistillationLoss(alpha_feat=0.1, alpha_logit=1.0, alpha_depth=0.1).to(device)
     encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
     
     epochs = 15
     ACCUMULATION_STEPS = 8
     
+    # Filter optimizer to include the SE block and the unfrozen head
     optimizer = optim.AdamW([
-        {'params': student.backbone_stem.parameters(), 'lr': 1e-5},
-        {'params': student.reduce_channel.parameters(), 'lr': 1e-4},
-        {'params': student.view_transformer.parameters(), 'lr': 5e-4}, 
-        {'params': student.bev_head.parameters(), 'lr': 1e-5}          
-    ], weight_decay=1e-4)                                            
+        {'params': filter(lambda p: p.requires_grad, student.backbone_stem.parameters()), 'lr': 1e-5},
+        {'params': filter(lambda p: p.requires_grad, student.reduce_channel.parameters()), 'lr': 1e-4},
+        {'params': filter(lambda p: p.requires_grad, student.view_transformer.parameters()), 'lr': 5e-4},
+        {'params': filter(lambda p: p.requires_grad, student.adaptation.parameters()), 'lr': 5e-4},
+        {'params': filter(lambda p: p.requires_grad, student.se_block.parameters()), 'lr': 5e-4},
+        {'params': filter(lambda p: p.requires_grad, student.bev_head.parameters()), 'lr': 1e-4}
+    ], weight_decay=1e-4)                                 
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-8)
     scaler = torch.amp.GradScaler('cuda')
@@ -98,6 +128,7 @@ def train_student(args):
     if args.resume and os.path.exists(best_checkpoint_path):
         checkpoint = torch.load(best_checkpoint_path, map_location=device)
         student.load_state_dict(checkpoint['model_state_dict'])
+        ema_student.ema.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['model_state_dict']))
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -106,6 +137,7 @@ def train_student(args):
     
     for epoch in range(start_epoch, epochs):
         student.train() 
+        
         epoch_train_loss = 0.0
         batch_start_time = time.time()
         optimizer.zero_grad(set_to_none=True)
@@ -119,9 +151,7 @@ def train_student(args):
             intrinsics = batch['intrinsics'].to(device, non_blocking=True)
             extrinsics = batch['extrinsics'].to(device, non_blocking=True)
             
-            # PRE-INVERT ON GPU BEFORE THE FORWARD PASS
             extrinsics_inv = torch.inverse(extrinsics)
-            
             depth_labels = batch['depth_labels'].to(device, non_blocking=True)
             
             encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
@@ -134,13 +164,18 @@ def train_student(args):
                     teacher_features = teacher_outputs.get('bev_features', None)
                     if teacher_features is not None:
                         teacher_features = torch.flip(teacher_features, dims=[-1])
+                        
+                    teacher_logits = teacher_outputs.get('bev_occupancy', None)
+                    if teacher_logits is not None:
+                        teacher_logits = torch.flip(teacher_logits, dims=[-1])
 
                 student_outputs = student(camera_images, intrinsics, extrinsics_inv)
                 
                 total_loss, loss_dict = criterion(
                     student_outputs, 
                     teacher_features, 
-                    targets_gpu['bev_occupancy'],
+                    ground_truth=targets_gpu['bev_occupancy'],
+                    teacher_logits=teacher_logits,
                     depth_labels=depth_labels
                 )
                 loss = total_loss / ACCUMULATION_STEPS
@@ -153,6 +188,9 @@ def train_student(args):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                
+                # Update EMA shadow weights after each optimizer step
+                ema_student.update(student)
             
             true_loss = loss.item() * ACCUMULATION_STEPS
             epoch_train_loss += true_loss
@@ -161,6 +199,7 @@ def train_student(args):
             writer.add_scalar('Training/Batch_Total_Loss', true_loss, global_step)
             writer.add_scalar('Training/Batch_Det_Loss', loss_dict['loss_det'], global_step)
             writer.add_scalar('Training/Batch_Feat_Loss', loss_dict['loss_feat'], global_step)
+            writer.add_scalar('Training/Batch_Logit_Loss', loss_dict['loss_logit'], global_step)
             writer.add_scalar('Training/Batch_Depth_Loss', loss_dict['loss_depth'], global_step)
             
             if batch_idx % 10 == 0:
@@ -178,11 +217,12 @@ def train_student(args):
         
         if (epoch + 1) % VAL_INTERVAL == 0 or (epoch + 1) == epochs:
             avg_val_loss, val_score = validate_student(student, teacher, val_dataloader, criterion, encoder, device)
-            print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Score: {val_score:.4f}")
+            print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {avg_train_loss:.4f} | EMA Val Score: {val_score:.4f}")
             
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': student.state_dict(),
+                'ema_state_dict': ema_student.ema.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
@@ -196,12 +236,12 @@ def train_student(args):
             if val_score > best_val_score:
                 best_val_score = val_score
                 torch.save(checkpoint, best_checkpoint_path)
-                print(f"--> [NEW BEST] Saved peak model with Val Score: {val_score:.4f} to {best_checkpoint_path}")
+                print(f"--> [NEW BEST] Saved peak EMA model with Val Score: {val_score:.4f} to {best_checkpoint_path}")
 
     writer.close()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train Student Monocular BEV')
+    parser = argparse.ArgumentParser(description='Train Student Monocular BEV with EMA & SE')
     parser.add_argument('--resume', action='store_true', help='Resume training from best checkpoint')
     parser.add_argument('--teacher_ckpt', type=str, default='best_waymo_bev_checkpoint.pt', help='Path to frozen Teacher model')
     parser.add_argument('--log_dir', type=str, default='runs/camera_student_01', help='TensorBoard log directory')

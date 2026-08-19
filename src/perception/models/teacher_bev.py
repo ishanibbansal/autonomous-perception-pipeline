@@ -184,13 +184,13 @@ class WaymoBEVDetector(nn.Module):
     def forward(self, lidar_points, batch_indices, camera_images, lidar_uvs):
         batch_size = camera_images.shape[0]
         
-        # [CRITICAL FIX]: Downsample the 1280x1920 images to 640x960 so the Teacher's 
-        # pre-trained ResNet filters recognize the vehicles at the correct pixel scale.
+        # [CRITICAL FIX]: Downsample the 1280x1920 images to 640x960 
         resized_images = F.interpolate(camera_images, size=(640, 960), mode='bilinear', align_corners=False)
         image_features = self.camera_encoder(resized_images)
         
-        u_norm = (lidar_uvs[:, 0] / 960.0) * 2.0 - 1.0
-        v_norm = (lidar_uvs[:, 1] / 640.0) * 2.0 - 1.0
+        # [CRITICAL FIX]: Normalize using the original 1920x1280 boundaries to map to [-1, 1]
+        u_norm = (lidar_uvs[:, 0] / 1920.0) * 2.0 - 1.0
+        v_norm = (lidar_uvs[:, 1] / 1280.0) * 2.0 - 1.0
         
         painted_points_list = []
         

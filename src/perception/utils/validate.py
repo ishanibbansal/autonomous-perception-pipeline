@@ -88,11 +88,18 @@ def validate_student(student, teacher, dataloader, criterion, encoder, device):
                 
                 t_feat = t_out.get('bev_features', None)
                 if t_feat is not None:
-                    # Sync Teacher feature maps to Student geometry prior to loss evaluation
                     t_feat = torch.flip(t_feat, dims=[-1])
 
                 s_out = student(val_cam, val_int, val_ext)
-                v_loss, v_dict = criterion(s_out, t_feat, val_gt, depth_labels=val_depths)
+                
+                # Clean explicit keyword arguments
+                v_loss, v_dict = criterion(
+                    s_out, 
+                    t_feat, 
+                    ground_truth=val_gt, 
+                    teacher_logits=None, 
+                    depth_labels=val_depths
+                )
                 
             val_loss_total += v_dict['loss_total']
 

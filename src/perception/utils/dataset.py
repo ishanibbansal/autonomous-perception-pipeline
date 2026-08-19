@@ -252,3 +252,143 @@ def waymo_collate_fn(batch):
         'lidar_uvs': torch.cat(all_uvs, dim=0),
         'batch_indices': torch.cat(batch_indices, dim=0)
     }
+
+# ==========================================
+# PHASE 2: TEMPORAL DATASET EXTENSIONS
+# ==========================================
+
+class WaymoTemporalDataset(WaymoDataset):
+    """
+    Extended dataset for Memory-Safe Temporal Fusion (History Caching).
+    Returns a sequence of frames (t_0, t_1, t_2) instead of randomized single frames.
+    Inherits from WaymoDataset to safely reuse TFRecord parsing utilities.
+    """
+    def __init__(self, tfrecord_path, max_boxes=100, is_train=False, seq_length=3):
+        # Initialize the parent class but disable LiDAR sweeps to save I/O time
+        super().__init__(tfrecord_path, max_boxes=max_boxes, is_train=is_train, num_sweeps=0)
+        self.seq_length = seq_length
+        
+        # Expand the frame cache to comfortably hold the entire temporal sequence in RAM
+        self._cache_capacity = self.seq_length * 2 
+
+    def __getitem__(self, idx):
+        sequence_data = []
+        
+        # 1. Anchor Frame (t_0)
+        anchor_frame = self._get_frame(idx)
+        anchor_time = anchor_frame.timestamp_micros
+        
+        for step in range(self.seq_length):
+            target_idx = max(0, idx - step)
+            frame = self._get_frame(target_idx)
+            
+            # 2. Scene Boundary Safety Check
+            # If the timestamp jumps significantly (e.g., end of one log, start of another),
+            # we duplicate the oldest valid frame to prevent cross-city temporal contamination.
+            dt_sec = (anchor_time - frame.timestamp_micros) / 1e6
+            if dt_sec > (step * 0.5 + 1.0): 
+                target_idx = max(0, idx - step + 1)
+                frame = self._get_frame(target_idx)
+                
+            # 3. Extract Core Camera Inputs
+            front_image = self._extract_front_image(frame)
+            intrinsics, extrinsics = self._extract_camera_params(frame)
+            
+            # 4. Extract Targets ONLY for the current frame (t_0)
+            if step == 0:
+                bboxes = np.zeros((self.max_boxes, 10), dtype=np.float32)
+                valid_idx = 0
+                for label in frame.laser_labels:
+                    if valid_idx >= self.max_boxes:
+                        break
+                    x, y, z = label.box.center_x, label.box.center_y, label.box.center_z
+                    l, w, h = label.box.length, label.box.width, label.box.height
+                    heading = label.box.heading
+                    
+                    if x > 2.0 and abs(y / x) < 0.6:
+                        bboxes[valid_idx] = np.array([label.type, 0.0, 0.0, x, y, z, l, w, h, heading], dtype=np.float32)
+                        valid_idx += 1
+                        
+                # Extract single-frame LiDAR strictly to generate the depth labels
+                lidar_points, lidar_uvs = self._extract_fusion_data(frame, is_current_frame=True)
+
+                # [CRITICAL FIX]: Append the missing time-delta feature (dt_sec = 0.0)
+                # The Teacher model was trained in Phase 1 where this column always existed.
+                dt_feature = np.zeros((lidar_points.shape[0], 1), dtype=np.float32)
+                lidar_points = np.concatenate([lidar_points, dt_feature], axis=1)
+                depth_label = np.full((80, 120), -1, dtype=np.int64) 
+                
+                valid_mask = (lidar_uvs[:, 0] >= 0) & (lidar_uvs[:, 0] < 1920) & \
+                             (lidar_uvs[:, 1] >= 0) & (lidar_uvs[:, 1] < 1280) & \
+                             (lidar_points[:, 0] >= 2.0) & (lidar_points[:, 0] < 50.0)
+                             
+                if valid_mask.any():
+                    v_uvs = lidar_uvs[valid_mask]
+                    v_depths = lidar_points[valid_mask, 0]
+                    
+                    sort_idx = np.argsort(v_depths)[::-1]
+                    v_uvs, v_depths = v_uvs[sort_idx], v_depths[sort_idx]
+                    
+                    u_feat = np.clip((v_uvs[:, 0] / 16.0).astype(np.int32), 0, 119)
+                    v_feat = np.clip((v_uvs[:, 1] / 16.0).astype(np.int32), 0, 79)
+                    d_bins = np.clip(((v_depths - 2.0) / 1.0).astype(np.int64), 0, 47)
+                    depth_label[v_feat, u_feat] = d_bins
+
+                # Note: Data augmentation (flips) is disabled here because flipping 
+                # sequences requires complex ego-motion matrix inversions.
+                step_data = {
+                    'camera_image': torch.from_numpy(front_image),       
+                    'intrinsics': torch.from_numpy(intrinsics),          
+                    'extrinsics': torch.from_numpy(extrinsics),
+                    'depth_label': torch.from_numpy(depth_label),
+                    'bboxes': torch.from_numpy(bboxes),
+                    'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32),
+                    'lidar_points': torch.from_numpy(lidar_points), # <--- ADD THIS
+                    'lidar_uvs': torch.from_numpy(lidar_uvs)        # <--- ADD THIS
+                }
+            else:
+                # Past frames (t_1, t_2) only need image and pose data for the caching module
+                step_data = {
+                    'camera_image': torch.from_numpy(front_image),       
+                    'intrinsics': torch.from_numpy(intrinsics),          
+                    'extrinsics': torch.from_numpy(extrinsics),
+                }
+                
+            sequence_data.append(step_data)
+            
+        return sequence_data
+
+
+def temporal_collate_fn(batch):
+    """
+    Transforms a list of sequences into a dictionary of batched timesteps.
+    Output structure: {'t_0': {...}, 't_1': {...}, 't_2': {...}}
+    """
+    seq_length = len(batch[0])
+    collated = {}
+    
+    for step in range(seq_length):
+        step_key = f't_{step}'
+        step_batch = [item[step] for item in batch]
+        
+        collated[step_key] = {
+            'camera_images': torch.stack([x['camera_image'] for x in step_batch]),
+            'intrinsics': torch.stack([x['intrinsics'] for x in step_batch]),
+            'extrinsics': torch.stack([x['extrinsics'] for x in step_batch])
+        }
+        
+        # Only t_0 contains the ground truth targets
+        if step == 0:
+            collated[step_key]['depth_labels'] = torch.stack([x['depth_label'] for x in step_batch])
+            collated[step_key]['bboxes'] = torch.stack([x['bboxes'] for x in step_batch])
+            collated[step_key]['num_valid_boxes'] = torch.stack([x['num_valid_boxes'] for x in step_batch])
+            
+            # <--- ADD THIS BLOCK --->
+            all_points = [x['lidar_points'] for x in step_batch]
+            all_uvs = [x['lidar_uvs'] for x in step_batch]
+            collated[step_key]['lidar_points'] = torch.cat(all_points, dim=0)
+            collated[step_key]['lidar_uvs'] = torch.cat(all_uvs, dim=0)
+            batch_indices = [torch.full((pts.shape[0],), i, dtype=torch.long) for i, pts in enumerate(all_points)]
+            collated[step_key]['batch_indices'] = torch.cat(batch_indices, dim=0)
+            
+    return collated

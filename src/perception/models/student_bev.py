@@ -1,10 +1,29 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.models import ResNet50_Weights
 import math
 
 from src.perception.models.teacher_bev import BiFPNBEVDecoder 
+
+# --- 1. Squeeze-and-Excitation Block ---
+class SEBlock(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, max(1, in_channels // reduction), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(1, in_channels // reduction), in_channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
 class LiftSplatViewTransformer(nn.Module):
     def __init__(self, in_channels=256, out_channels=64, bev_h=160, bev_w=160, 
@@ -37,7 +56,6 @@ class LiftSplatViewTransformer(nn.Module):
     def get_geometry(self, intrinsics, extrinsics_inv):
         B = intrinsics.shape[0]
         
-        # Bypass PyTorch FP16 matrix instability using closed-form algebra in FP32
         with torch.autocast('cuda', enabled=False):
             intrinsics = intrinsics.float()
             extrinsics_inv = extrinsics_inv.float()
@@ -77,7 +95,6 @@ class LiftSplatViewTransformer(nn.Module):
         x_idx = ((geom[..., 0] - self.x_min) / self.x_step).long()
         y_idx = ((geom[..., 1] - self.y_min) / self.y_step).long()
         
-        # Force exact spatial alignment with the Target Encoder's (Top, Left) layout
         x_idx = (self.bev_h - 1) - x_idx
         y_idx = (self.bev_w - 1) - y_idx
         
@@ -114,9 +131,86 @@ class LiftSplatViewTransformer(nn.Module):
         
         return bev_features, depth_logits
 
-class StudentBEVDetector(nn.Module):
-    def __init__(self, bev_h=160, bev_w=160, feature_channels=64):
+class TemporalBEVFusion(nn.Module):
+    """
+    Memory-Safe Temporal Fusion Module (History Caching).
+    Aligns past BEV features to the current ego-vehicle coordinate system
+    and fuses them using a detached computational graph to prevent VRAM overflow.
+    """
+    def __init__(self, in_channels=64):
         super().__init__()
+        # Reduces the concatenated [Current + Past] channels back to the original size
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Grid boundaries to map physical meters to [-1, 1] for grid_sample
+        self.x_extent = 70.0  # 0 to 70m
+        self.y_extent = 80.0  # -40 to 40m (total 80m span)
+
+    def align_past_features(self, past_features, current_extrinsic, past_extrinsic):
+        B, C, H, W = past_features.shape
+        
+        # 1. Compute relative transformation: T_rel = inv(T_current) @ T_past
+        # This tells us how the world moved relative to the ego-vehicle.
+        rel_transform = torch.inverse(current_extrinsic) @ past_extrinsic
+        
+        affine_matrices = torch.zeros(B, 2, 3, device=past_features.device)
+        
+        for b in range(B):
+            T = rel_transform[b]
+            
+            # Extract 2D translation and rotation for the BEV plane (X, Y)
+            # Waymo: X is forward, Y is left.
+            theta = torch.atan2(T[1, 0], T[0, 0])
+            
+            # Normalize translations by the physical grid extents to map to [-1, 1] grid space
+            tx = T[0, 3] / (self.x_extent / 2.0)
+            ty = T[1, 3] / (self.y_extent / 2.0)
+            
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            
+            # Build the 2x3 affine matrix for PyTorch grid_sample
+            affine_matrices[b, 0, 0] = cos_t
+            affine_matrices[b, 0, 1] = -sin_t
+            affine_matrices[b, 0, 2] = tx
+            affine_matrices[b, 1, 0] = sin_t
+            affine_matrices[b, 1, 1] = cos_t
+            affine_matrices[b, 1, 2] = ty
+
+        # 2. Generate warp grid and resample past features
+        # align_corners=False is mathematically preferred for bounding box tasks
+        grid = F.affine_grid(affine_matrices, past_features.size(), align_corners=False)
+        aligned_past = F.grid_sample(past_features, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        
+        return aligned_past
+
+    def forward(self, current_features, past_features, current_extrinsic, past_extrinsic):
+        if past_features is None:
+            # If there is no history (e.g., the very first frame of a sequence), 
+            # pad with a blank zero-tensor of the exact same shape.
+            aligned_past = torch.zeros_like(current_features)
+        else:
+            # [CRITICAL MEMORY SHIELD]: Detach the past features! 
+            # This prevents PyTorch from backpropagating through the previous timestep's ResNet.
+            past_features = past_features.detach()
+            
+            # Physically rotate and shift the past feature map to match current ego-position
+            aligned_past = self.align_past_features(past_features, current_extrinsic, past_extrinsic)
+
+        # Concatenate along the channel dimension (e.g., 64 + 64 = 128)
+        fused = torch.cat([current_features, aligned_past], dim=1)
+        
+        # Compress back down to standard feature depth (64)
+        return self.fusion_conv(fused)
+
+class StudentBEVDetector(nn.Module):
+    def __init__(self, bev_h=160, bev_w=160, feature_channels=64, use_temporal=False):
+        super().__init__()
+        self.use_temporal = use_temporal
         
         resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
         self.backbone_stem = nn.Sequential(
@@ -132,17 +226,46 @@ class StudentBEVDetector(nn.Module):
             in_channels=256, out_channels=feature_channels, bev_h=bev_h, bev_w=bev_w
         )
         
+        # 1. Feature Adaptation Layer
+        self.adaptation = nn.Sequential(
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # 2. Squeeze-and-Excitation Channel Attention
+        self.se_block = SEBlock(in_channels=feature_channels)
+        
+        # 3. Conditional Temporal Fusion (Only active for Phase 2)
+        if self.use_temporal:
+            self.temporal_fusion = TemporalBEVFusion(in_channels=feature_channels)
+            
         self.bev_head = BiFPNBEVDecoder(in_channels=feature_channels)
 
-    def forward(self, camera_images, intrinsics, extrinsics_inv):
+    def forward(self, camera_images, intrinsics, extrinsics_inv, past_features=None, current_extrinsics=None, past_extrinsics=None):
         x = self.backbone_stem(camera_images)
         x = self.reduce_channel(x)
-        bev_features, depth_logits = self.view_transformer(x, intrinsics, extrinsics_inv)
         
-        head_outputs = self.bev_head(bev_features)
+        raw_bev_features, depth_logits = self.view_transformer(x, intrinsics, extrinsics_inv)
+        
+        adapted_features = self.adaptation(raw_bev_features)
+        cleaned_features = self.se_block(adapted_features)
+        
+        # --- Route features based on active Phase ---
+        if self.use_temporal:
+            fused_features = self.temporal_fusion(
+                current_features=cleaned_features,
+                past_features=past_features,
+                current_extrinsic=current_extrinsics,
+                past_extrinsic=past_extrinsics
+            )
+        else:
+            fused_features = cleaned_features
+            
+        head_outputs = self.bev_head(fused_features)
         
         out = {
-            'bev_features': bev_features,
+            'bev_features': fused_features, 
             'depth_logits': depth_logits
         }
         out.update(head_outputs)
