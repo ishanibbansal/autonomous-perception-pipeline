@@ -57,3 +57,28 @@
      * *Symptom:* Predicted occupancy clusters appeared inverted along the vertical axis.
      * *Root Cause:* OpenCV renders matrices with origin at the top-left, whereas PyTorch BEV target grids anchor $(X=0, Y=0)$ at the bottom.
      * *Fix:* Applied vertical inversion (`cv::flip(heatmap, heatmap, 0)`) before colormap mapping and generated a side-by-side stitched frame (`cv::hconcat`) combining the camera perspective with the 3D BEV occupancy heatmap.
+
+### Log 3.13: The WSL Swap Thrashing Wall and Dataloader Memory Management
+* **Date:** August 18, 2026
+* **Symptom:** Training batch times sporadically spiked from 0.5 s/batch to 1.2–3.3 s/batch, specifically at epoch boundaries or after prolonged continuous uptime. 
+* **Root Cause:** A hard collision between PyTorch's multiprocessing and physical RAM limits. With 32GB of total system RAM, Windows background processes (12GB), WSL allocations, and PyTorch's `num_workers=8` triggered the memory "Cliff Effect." PyTorch's Copy-on-Write (CoW) memory duplication maxed out the remaining RAM, forcing the Linux kernel to aggressively push the WSL virtual machine into the NVMe swap file, crippling CPU execution speeds.
+* **Solution:** 
+  1. Reduced `num_workers` to `4` for training and `2` for validation to keep the dataset footprint safely within physical RAM.
+  2. Set `persistent_workers=False` to enforce strict garbage collection and destroy the memory bloat at the end of every epoch. The pipeline locked back into a stable 0.5 s/batch.
+
+### Log 3.14: Phase 2 Temporal Dataset Dimension Mismatch & Alignment
+* **Date:** August 18, 2026
+* **Symptom:** Phase 2 initialization instantly crashed with `RuntimeError: mat1 and mat2 shapes cannot be multiplied (52945x70 and 71x64)` in the Teacher's PointPillar encoder. A subsequent run failed with `NameError: name 'F' is not defined` inside `student_bev.py`.
+* **Root Cause:** 
+  1. Transitioning from `WaymoDataset` to `WaymoTemporalDataset` with `num_sweeps=0` bypassed the logic that appended the `dt_sec` (time-delta) column to the LiDAR point cloud, leaving the array at 70 channels instead of the Teacher's strictly expected 71.
+  2. The temporal fusion `align_past_features` function was never executed during Phase 1 spatial training, masking a missing `torch.nn.functional` import used for the `affine_grid` transformation.
+* **Solution:** 
+  1. Manually appended a dummy `dt_sec = 0.0` feature column to the $t_0$ LiDAR points inside `WaymoTemporalDataset` to satisfy the Teacher's expected input shape.
+  2. Added the missing `import torch.nn.functional as F` to the student model architecture file.
+
+### Log 3.15: Temporal Efficacy and The "Comet Tail" Effect
+* **Date:** August 18, 2026
+* **Objective:** Validate the implementation of the temporal history loop ($t_{-2} \rightarrow t_0$) and assess its impact on Birds-Eye-View perception compared to the spatial baseline.
+* **Results:** The Phase 2 Temporal Student reached a validation score of **13.7% EMA**, successfully doubling the Phase 1 spatial baseline of 6.2%. 
+* **Observations:** Authored a chronological visualizer (`predict_student_temporal.py`) to map predictions. The model accurately maps lane topology and object persistence through occlusions. As expected with monocular physics, predictions exhibited the "Comet Tail" effect—tight lateral localization with elongated vertical depth smearing due to inherent 2D-to-3D geometric uncertainty. 
+* **Next Steps:** Proceeding to Phase 3 End-to-End (E2E) Fine-Tuning. The spatial backbone will be unfrozen with a micro learning rate (`1e-5`) to allow temporal gradients to optimize the ResNet camera extractor.
