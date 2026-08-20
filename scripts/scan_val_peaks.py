@@ -1,5 +1,6 @@
-import os
 import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Anchor paths to the project root directory (one level up from utils)
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -10,8 +11,8 @@ import torch
 import glob
 from torch.utils.data import ConcatDataset
 
-from model import WaymoBEVDetector 
-from utils.dataset import WaymoDataset
+from src.perception.models.teacher_bev import WaymoBEVDetector 
+from src.perception.utils.dataset import WaymoDataset
 
 def scan_validation_peaks(checkpoint_path='best_waymo_bev_checkpoint.pt', num_frames=50):
     if not os.path.isabs(checkpoint_path):

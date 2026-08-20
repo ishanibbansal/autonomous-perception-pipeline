@@ -1,12 +1,15 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import cv2
 import numpy as np
 import torchvision.transforms.functional as TF
 import math
-import os
 
-from model import Waymo3DDetector 
-from utils.validate import decode_predictions
+from src.perception.models.teacher_bev import Waymo3DDetector 
+from src.perception.utils.validate import decode_predictions
 
 def draw_3d_wireframe(img, x, y, z, l, w, h, heading, color=(0, 255, 0), thickness=2):
     IMAGE_WIDTH = 960.0
@@ -60,9 +63,9 @@ def draw_3d_wireframe(img, x, y, z, l, w, h, heading, color=(0, 255, 0), thickne
             
     return img
 
-def predict_single_frame(image_path, checkpoint_path='best_waymo_3d_checkpoint.pt', output_path='prediction_output.jpg'):
-    print(f"Loading model from {checkpoint_path} onto CPU...")
-    device = torch.device('cpu')
+def predict_single_frame(image_path, checkpoint_path, output_path='prediction_output.jpg'):
+    print(f"Loading model from {checkpoint_path}...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = Waymo3DDetector() 
     
@@ -87,11 +90,12 @@ def predict_single_frame(image_path, checkpoint_path='best_waymo_3d_checkpoint.p
         return
         
     img_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+    
     img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() 
     img_tensor = TF.resize(img_tensor, [640, 960], antialias=True)
     img_tensor = img_tensor.unsqueeze(0).to(device)
     
-    print("Running CPU inference...")
+    print("Running inference...")
     with torch.no_grad():
         predictions = model(img_tensor)
         
@@ -124,6 +128,6 @@ def predict_single_frame(image_path, checkpoint_path='best_waymo_3d_checkpoint.p
 
 if __name__ == '__main__':
     test_image_path = 'test_frame.jpg' 
-    checkpoint_file = 'best_waymo_3d_checkpoint.pt'
+    checkpoint_file = 'waymo_3d_checkpoint.pt'
     
     predict_single_frame(test_image_path, checkpoint_file)

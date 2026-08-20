@@ -9,6 +9,7 @@ ENV/
 __pycache__/
 *.py[cod]
 .DS_Store
+*.deb
 
 # Waymo Data Files (CRITICAL)
 data/
@@ -19,11 +20,11 @@ data/
 *.bag
 
 # Model Checkpoints & Weights
-models/
 *.pth
 *.pt
 *.onnx
 *.weights
+*.engine
 
 # Logs & Training Outputs
 *.log
@@ -40,3 +41,8 @@ runs/
 
 # VS Code Settings
 .vscode/
+
+# ROS 2 Build Artifacts
+build/
+install/
+log/

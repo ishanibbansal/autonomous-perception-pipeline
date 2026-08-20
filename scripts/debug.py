@@ -1,10 +1,14 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 from torch.utils.data import DataLoader
 
 # Import your existing modules
-from model import Waymo3DDetector
-from utils.dataset import WaymoDataset
-from utils.target_encoder import TargetEncoder
+from src.perception.models.teacher_bev import WaymoBEVDetector
+from src.perception.utils.dataset import WaymoDataset
+from src.perception.utils.target_encoder import BEVGridEncoder
 
 def debug_validation_batch(model, val_dataloader, encoder, device):
     print("\n--- RUNNING VALIDATION DEBUGGER ---")
@@ -60,8 +64,8 @@ if __name__ == '__main__':
     print(f"Using device: {device}")
     
     # 1. Initialize the architecture
-    model = Waymo3DDetector().to(device)
-    encoder = TargetEncoder()
+    model = WaymoBEVDetector().to(device)
+    encoder = BEVGridEncoder()
     
     # 2. Load your trained weights from the Epoch 15 checkpoint
     checkpoint_path = "waymo_3d_checkpoint.pt"
@@ -82,7 +86,10 @@ if __name__ == '__main__':
     model.eval() # CRITICAL: Lock those BatchNorm layers!
     
     # 3. Initialize just the validation dataloader
-    val_file = 'data/raw/segment-10072140764565668044_4060_000_4080_000_with_camera_labels.tfrecord'
+    val_files = glob.glob('data/raw/*.tfrecord') + glob.glob('data/raw/val/*.tfrecord')
+    if not val_files:
+        raise FileNotFoundError("No .tfrecord files found for debugging.")
+    val_file = val_files[0] # Just grab the first one it finds
     val_dataset = WaymoDataset(tfrecord_path=val_file)
     val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     

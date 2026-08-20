@@ -53,7 +53,7 @@ class BEVGridEncoder:
                     continue
                     
                 # 1. Calculate continuous floating-point grid coordinates
-                ctx_feat = (y - self.y_range[0]) / self.res_y
+                ctx_feat = self.grid_w - 1 - ((y - self.y_range[0]) / self.res_y)
                 cty_feat = self.grid_h - 1 - ((x - self.x_range[0]) / self.res_x)
                 
                 # 2. Get discrete integer grid indices
