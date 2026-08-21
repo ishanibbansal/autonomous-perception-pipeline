@@ -82,3 +82,17 @@
 * **Results:** The Phase 2 Temporal Student reached a validation score of **13.7% EMA**, successfully doubling the Phase 1 spatial baseline of 6.2%. 
 * **Observations:** Authored a chronological visualizer (`predict_student_temporal.py`) to map predictions. The model accurately maps lane topology and object persistence through occlusions. As expected with monocular physics, predictions exhibited the "Comet Tail" effect—tight lateral localization with elongated vertical depth smearing due to inherent 2D-to-3D geometric uncertainty. 
 * **Next Steps:** Proceeding to Phase 3 End-to-End (E2E) Fine-Tuning. The spatial backbone will be unfrozen with a micro learning rate (`1e-5`) to allow temporal gradients to optimize the ResNet camera extractor.
+
+### Log 3.16: Bridging Perception to Planning (The NMS Peak Extractor)
+* **Date:** August 21, 2026
+* **Objective:** Translate the Teacher model's continuous probability heatmaps into rigid physical coordinates (X, Y, length, width, heading) required for downstream robotic trajectory planning.
+* **Symptom:** Direct $3 \times 3$ max-pooling spawned dozens of overlapping green bounding boxes for a single vehicle. Box orientations were also mirrored relative to the Ground Truth.
+* **Root Cause:** 
+  1. **The Flat Plateau Bug:** The neural network's sigmoid activations saturated at exactly `1.000` over large clusters of pixels. `nonzero()` evaluated all adjacent pixels as the "maximum", spawning 5-10 duplicate boxes per vehicle.
+  2. **Top-K Starvation:** Attempting to fix the plateaus using `torch.topk(30)` mathematically truncated genuine detections. A single saturated car plateau would consume 15 of the 30 available slots, causing the network to completely ignore other cars in the scene.
+  3. **Mirrored Math:** The target grid was horizontally flipped (`torch.flip(..., dims=[-1])`) to align visual space, but the neural network's sub-pixel offset (`offset_x`) and orientation vector (`sin_h`) predictions were not negated, causing boxes to point in reverse.
+* **Solution:** 
+  1. Implemented an industrial-grade Non-Maximum Suppression (NMS) decoder using a larger $5 \times 5$ max-pooling kernel.
+  2. Reverted to full `nonzero()` extraction to prevent starvation, and applied an aggressive 2.5-meter Euclidean radius suppression sweep to guarantee single-box-per-vehicle outputs.
+  3. Negated `offset_x` and `sin_h` in the decoding loop to mathematically align the vectors with the flipped coordinate space.
+* **Next Steps (Phase Transition):** The Perception pipeline is now structurally complete. Small amounts of hallucinated false positives/negatives remain in the output, which is standard for raw sensor inference. The project is officially transitioning to the **Prediction and Planning** phase. The next step is building an Extended Kalman Filter (EKF) tracking node in ROS 2 (`rclpy`) to filter out ghost tracks and enforce object permanence across time.
