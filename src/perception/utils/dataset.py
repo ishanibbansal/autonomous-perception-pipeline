@@ -3,6 +3,7 @@ import struct
 import random
 import numpy as np
 import torch
+import torchvision.transforms as T
 from torch.utils.data import Dataset
 from collections import OrderedDict
 import tensorflow as tf
@@ -254,7 +255,7 @@ def waymo_collate_fn(batch):
     }
 
 # ==========================================
-# PHASE 2: TEMPORAL DATASET EXTENSIONS
+# PHASE 2/3: TEMPORAL DATASET EXTENSIONS
 # ==========================================
 
 class WaymoTemporalDataset(WaymoDataset):
@@ -270,6 +271,14 @@ class WaymoTemporalDataset(WaymoDataset):
         
         # Expand the frame cache to comfortably hold the entire temporal sequence in RAM
         self._cache_capacity = self.seq_length * 2 
+
+        # [NEW]: Initialize Photometric Augmentation for training
+        self.color_jitter = T.ColorJitter(
+            brightness=0.2, 
+            contrast=0.2, 
+            saturation=0.2, 
+            hue=0.05
+        ) if self.is_train else None
 
     def __getitem__(self, idx):
         sequence_data = []
@@ -293,6 +302,13 @@ class WaymoTemporalDataset(WaymoDataset):
             # 3. Extract Core Camera Inputs
             front_image = self._extract_front_image(frame)
             intrinsics, extrinsics = self._extract_camera_params(frame)
+            
+            # Convert NumPy image to Tensor early to apply augmentations
+            img_tensor = torch.from_numpy(front_image)
+            
+            # [NEW]: Apply photometric jitter independently to each frame in the sequence
+            if self.color_jitter is not None:
+                img_tensor = self.color_jitter(img_tensor)
             
             # 4. Extract Targets ONLY for the current frame (t_0)
             if step == 0:
@@ -337,19 +353,19 @@ class WaymoTemporalDataset(WaymoDataset):
                 # Note: Data augmentation (flips) is disabled here because flipping 
                 # sequences requires complex ego-motion matrix inversions.
                 step_data = {
-                    'camera_image': torch.from_numpy(front_image),       
+                    'camera_image': img_tensor,       
                     'intrinsics': torch.from_numpy(intrinsics),          
                     'extrinsics': torch.from_numpy(extrinsics),
                     'depth_label': torch.from_numpy(depth_label),
                     'bboxes': torch.from_numpy(bboxes),
                     'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32),
-                    'lidar_points': torch.from_numpy(lidar_points), # <--- ADD THIS
-                    'lidar_uvs': torch.from_numpy(lidar_uvs)        # <--- ADD THIS
+                    'lidar_points': torch.from_numpy(lidar_points), 
+                    'lidar_uvs': torch.from_numpy(lidar_uvs)        
                 }
             else:
                 # Past frames (t_1, t_2) only need image and pose data for the caching module
                 step_data = {
-                    'camera_image': torch.from_numpy(front_image),       
+                    'camera_image': img_tensor,       
                     'intrinsics': torch.from_numpy(intrinsics),          
                     'extrinsics': torch.from_numpy(extrinsics),
                 }
