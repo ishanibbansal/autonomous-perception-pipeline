@@ -14,6 +14,18 @@ It features a **Teacher-Student Knowledge Distillation** architecture transferri
 
 ---
 
+## Edge Deployment (C++ & TensorRT)
+
+The primary engineering constraint of this pipeline is real-time autonomous execution. Relying on Python/PyTorch for inference introduces unacceptable overhead for vehicle motion planning.
+
+To bridge this, the Student monocular model is actively being translated into a bare-metal C++ TensorRT engine (`student_bev_inference`).
+* **Memory Management:** Replaces Python's dynamic garbage collection with pre-allocated contiguous memory pools for input/output tensors.
+* **Precision Targeting:** Compiles the ONNX graph into an FP16 TensorRT engine to maximize throughput on edge NVIDIA hardware while maintaining 3D bounding box regression accuracy.
+* **ROS 2 Integration:** Wrapped in a zero-copy `rclcpp` Node to publish physical bounding box arrays directly to the EKF prediction stack with sub-millisecond serialization latency.
+  
+---
+
+
 ## System Architecture & Network Setup
 
 This project uses a distributed headless compute model:
