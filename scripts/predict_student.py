@@ -74,14 +74,14 @@ def main():
     axes[0].set_title("Front Camera Input")
     axes[0].axis('off')
 
-    # Plot 2: Ground Truth BEV
-    axes[1].imshow(gt_grid, cmap='Blues', origin='lower')
+    # Plot 2: Ground Truth BEV (Top: Far ahead, Bottom: Ego vehicle)
+    axes[1].imshow(gt_grid, cmap='Blues', origin='upper')
     axes[1].set_title("Ground Truth BEV")
     axes[1].axis('off')
 
     # Plot 3: Predicted BEV Probabilities
     # Using 'magma' heatmap to show model confidence
-    im = axes[2].imshow(pred_probs, cmap='magma', vmin=0.0, vmax=1.0, origin='lower')
+    im = axes[2].imshow(pred_probs, cmap='magma', vmin=0.0, vmax=1.0, origin='upper')
     axes[2].set_title("Predicted BEV Heatmap")
     axes[2].axis('off')
     

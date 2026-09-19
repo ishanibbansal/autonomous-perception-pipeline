@@ -91,12 +91,12 @@ def visualize_temporal(args):
                     axes[0].axis('off')
                     
                     # Ground Truth (Crisp LiDAR)
-                    axes[1].imshow(gt_occ, cmap='Blues', origin='lower', vmin=0, vmax=1)
+                    axes[1].imshow(gt_occ, cmap='Blues', origin='upper', vmin=0, vmax=1)
                     axes[1].set_title('Ground Truth (LiDAR Boxes)', fontsize=14)
                     axes[1].axis('off')
                     
                     # Prediction (Camera Heatmap - Comet Tails)
-                    axes[2].imshow(occ_probs, cmap='magma', origin='lower', vmin=0, vmax=0.8)
+                    axes[2].imshow(occ_probs, cmap='magma', origin='upper', vmin=0, vmax=0.8)
                     axes[2].set_title(f'Temporal Prediction (13.7% EMA)', fontsize=14)
                     axes[2].axis('off')
                     

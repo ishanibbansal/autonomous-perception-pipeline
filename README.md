@@ -18,11 +18,24 @@ It features a **Teacher-Student Knowledge Distillation** architecture transferri
 
 The primary engineering constraint of this pipeline is real-time autonomous execution. Relying on Python/PyTorch for inference introduces unacceptable overhead for vehicle motion planning.
 
-To bridge this, the Student monocular model is actively being translated into a bare-metal C++ TensorRT engine (`student_bev_inference`).
-* **Memory Management:** Replaces Python's dynamic garbage collection with pre-allocated contiguous memory pools for input/output tensors.
-* **Precision Targeting:** Compiles the ONNX graph into an FP16 TensorRT engine to maximize throughput on edge NVIDIA hardware while maintaining 3D bounding box regression accuracy.
-* **ROS 2 Integration:** Wrapped in a zero-copy `rclcpp` Node to publish physical bounding box arrays directly to the EKF prediction stack with sub-millisecond serialization latency.
-  
+To bridge this, the Student monocular model is deployed via a bare-metal C++ TensorRT ROS 2 package (`student_bev_inference`), validated to achieve full numerical and spatial parity with the PyTorch baseline:
+* **Memory Management:** Replaces Python's dynamic garbage collection with pre-allocated contiguous GPU/CPU memory pools for input and output tensors.
+* **Precision Targeting:** Compiles the ONNX graph into a TensorRT engine to maximize throughput on NVIDIA hardware while preserving 3D occupancy geometry.
+* **ROS 2 Integration:** Wrapped in a zero-copy `rclcpp` Node (`bev_node`) subscribing to `/camera/image_raw` and publishing 3D BEV occupancy heatmaps to `/perception/bev_heatmap`.
+
+**Building & Running the C++ Node:**
+```bash
+# Build the ROS 2 package
+colcon build --packages-select student_bev_inference
+
+# Terminal 1: Launch the C++ inference node
+source install/setup.bash
+ros2 run student_bev_inference bev_node --ros-args -p engine_path:=student_bev.engine
+
+# Terminal 2: Publish a test image and evaluate output
+python3 scripts/test_ros_node.py
+```
+
 ---
 
 
@@ -49,10 +62,14 @@ Ensure your WSL2 environment can access the host NVIDIA drivers by adding this t
     ├── docs/                        # Documentation and engineering logs
     │   └── dev_log.md
     ├── scripts/                     # Pipeline utility and training scripts
+    │   ├── compare_pipelines.py     # PyTorch vs. C++ TensorRT parity verification tool
+    │   ├── test_ros_node.py         # ROS 2 test publisher and heatmap evaluator
+    │   ├── extract_calib.py         # Camera intrinsic/extrinsic calibration extractor
     │   ├── export_onnx.py           # Static ONNX graph exporter
     │   ├── train_student.py         # Phase 1: Spatial Initialization
     │   ├── train_student_temporal.py # Phase 2: Temporal Fusion
     │   ├── train_student_e2e.py     # Phase 3: End-to-End Fine-Tuning
+    │   ├── predict_student.py       # Monocular Student BEV prediction visualizer
     │   └── predict_bev.py           # NMS Bounding Box visualizer
     ├── src/                         # Core architecture and ROS 2 workspace
     │   ├── perception/
