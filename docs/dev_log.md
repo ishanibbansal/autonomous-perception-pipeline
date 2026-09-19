@@ -188,3 +188,18 @@ This file serves as a living technical journal for the project. It tracks active
   2. Reverted to full `nonzero()` extraction to prevent starvation, and applied an aggressive 2.5-meter Euclidean radius suppression sweep to guarantee single-box-per-vehicle outputs.
   3. Negated `offset_x` and `sin_h` in the decoding loop to mathematically align the vectors with the flipped coordinate space.
 * **Next Steps (Phase Transition):** The Perception pipeline is now structurally complete. Small amounts of hallucinated false positives/negatives remain in the output, which is standard for raw sensor inference. The project is officially transitioning to the **Prediction and Planning** phase. The next step is building an Extended Kalman Filter (EKF) tracking node in ROS 2 (`rclpy`) to filter out ghost tracks and enforce object permanence across time.
+
+### Log 3.17: C++ TensorRT vs. Python Inference Parity & Coordinate Alignment Fix
+* **Date:** September 19, 2026
+* **Branch:** `feature/cpp-inference-parity`
+* **Symptoms:** 
+  1. The C++ TensorRT node produced significantly worse confidence / empty heatmaps compared to the Python `predict_student.py` model on test images.
+  2. Detected vehicle positions in the BEV appeared flipped relative to the camera image (e.g., closest vehicles on the left appeared farthest, and farthest vehicles on the right appeared closest).
+* **Root Causes:**
+  1. **Image Degradation & Calibration Drift:** `test_frame.jpg` was an old, lossy 640×960 JPEG upscaled 2× to 1280×1920, starving the ResNet50 backbone of high-frequency spatial features. Additionally, the C++ node used mismatched/inverted extrinsics.
+  2. **Double Inversion Bug (Revisiting Log 3.12):** In `BEVGridEncoder` and `LiftSplatViewTransformer`, grid row indexing is defined as $\text{row} = 159 - \frac{X - X_{\min}}{\text{res}_x}$. Row 0 represents $X = 70\text{ m}$ (far ahead) while row 159 represents $X = 0\text{ m}$ (ego bumper). In standard matrix/image coordinate conventions (OpenCV), row 0 is at the top and row 159 is at the bottom, so the raw output was *already* canonically oriented for top-down driving. Matplotlib's `origin='lower'` in `predict_student.py` inverted this display, leading to the erroneous `cv::flip(heatmap, heatmap, 0)` introduced in Log 3.12.
+* **Solutions:**
+  1. Authored `scripts/compare_pipelines.py` to extract a pristine, lossless 1280×1920 PNG (`test_frame_clean.png`) and dump exact per-frame raw extrinsics and intrinsics. Updated `test_ros_node.py` to publish the clean frame.
+  2. Updated `student_bev_node.cpp` with matching calibration and added runtime min/max probability logging. TensorRT peak confidence jumped from near zero to **0.7746**.
+  3. Removed `cv::flip(heatmap, heatmap, 0)` from `student_bev_node.cpp`. Corrected plotting to `origin='upper'` across `compare_pipelines.py`, `predict_student.py`, and `predict_student_temporal.py`.
+* **Outcome:** The C++ TensorRT ROS 2 inference node achieved complete numerical and spatial parity with the PyTorch model, correctly placing near-left vehicles at bottom-left and receding vehicles at top-right.

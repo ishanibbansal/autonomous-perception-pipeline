@@ -28,14 +28,22 @@ def extract_calibration(tfrecord_path):
                 # 2. Extract Extrinsics (Sensor to Vehicle)
                 extrinsics = np.array(calibration.extrinsic.transform).reshape(4, 4)
                 
-                # Calculate Inverse (Vehicle to Sensor) - commonly used in BEV grids
-                extrinsics_inv = np.linalg.inv(extrinsics)
-                
-                print("\n// 2. Front Camera Extrinsics Inverse (Vehicle to Sensor)")
+                # RAW extrinsics (Sensor to Vehicle) - this is what the model was trained on
+                print("\n// 2. Front Camera Extrinsics RAW (Sensor to Vehicle)")
+                print("// NOTE: The StudentBEVDetector was trained with raw extrinsics passed")
+                print("//       into the 'extrinsics_inv' parameter. Use these values.")
                 print("float extrinsics_inv[16] = {")
-                for row in extrinsics_inv:
+                for row in extrinsics:
                     print(f"    {row[0]:.6f}f, {row[1]:.6f}f, {row[2]:.6f}f, {row[3]:.6f}f,")
                 print("};")
+                
+                # Also print the actual inverse for reference
+                extrinsics_inv = np.linalg.inv(extrinsics)
+                print("\n// 3. Front Camera Extrinsics Inverse (Vehicle to Sensor) [REFERENCE ONLY]")
+                print("// float extrinsics_inv_actual[16] = {")
+                for row in extrinsics_inv:
+                    print(f"//     {row[0]:.6f}f, {row[1]:.6f}f, {row[2]:.6f}f, {row[3]:.6f}f,")
+                print("// };")
                 print("// ------------------------------------\n")
                 return
                 

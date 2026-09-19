@@ -105,6 +105,7 @@ private:
 
             // 2. Preprocess the inference frame
             cv::Mat frame = orig_frame.clone();
+            cv::resize(frame, frame, cv::Size(1920, 1280));
             cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
             frame.convertTo(frame, CV_32FC3, 1.0f / 255.0f);
 
@@ -119,16 +120,16 @@ private:
             memcpy(chw_image.data() + 2 * 1280 * 1920, channels[2].data, channel_size);
 
             float intrinsics[9] = {
-                2083.091212f, 0.0f, 957.293829f,
-                0.0f, 2083.091212f, 650.569793f,
+                2071.393311f, 0.0f, 952.380554f,
+                0.0f, 2071.393311f, 653.867004f,
                 0.0f, 0.0f, 1.0f
             };
 
             float extrinsics_inv[16] = {
-                 0.0f,  0.0f,  1.0f,  2.0f,
-                -1.0f,  0.0f,  0.0f,  0.0f,
-                 0.0f, -1.0f,  0.0f,  1.5f,
-                 0.0f,  0.0f,  0.0f,  1.0f
+                0.999993f, -0.003288f, 0.001520f, 1.544000f,
+                0.003287f, 0.999994f, 0.000957f, -0.023973f,
+                -0.001523f, -0.000952f, 0.999998f, 2.115636f,
+                0.000000f, 0.000000f, 0.000000f, 1.000000f
             };
 
             cudaMemcpyAsync(d_camera_image_, chw_image.data(), chw_image.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
@@ -142,14 +143,20 @@ private:
             cudaStreamSynchronize(stream_); 
 
             // 3. Post-Process the Heatmap
+            // Orientation: Row 0 is Top (X=70m, Far Ahead), Row 159 is Bottom (X=0m, Ego Bumper).
+            // Col 0 is Left (Y=+40m), Col 159 is Right (Y=-40m).
+            // No vertical flip is needed - raw grid orientation is already canonically top-down.
             cv::Mat heatmap(160, 160, CV_8UC1);
+            float max_prob = 0.0f;
+            float min_prob = 1.0f;
             for (int i = 0; i < 160 * 160; ++i) {
                 float prob = 1.0f / (1.0f + std::exp(-output_logits[i]));
+                if (prob > max_prob) max_prob = prob;
+                if (prob < min_prob) min_prob = prob;
                 heatmap.data[i] = static_cast<uint8_t>(prob * 255.0f);
             }
+            RCLCPP_INFO(this->get_logger(), "TensorRT Inference Complete. Probabilities - Min: %.4f, Max: %.4f", min_prob, max_prob);
 
-            // CRITICAL FIX: Flip vertically to correct OpenCV top-down rendering
-            cv::flip(heatmap, heatmap, 0);
             cv::applyColorMap(heatmap, heatmap, cv::COLORMAP_MAGMA);
 
             // 4. Create the Side-by-Side Visualization

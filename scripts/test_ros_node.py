@@ -24,7 +24,11 @@ class ImageTester(Node):
         
         # Dynamically resolve the absolute path to the repository root
         self.repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.image_path = os.path.join(self.repo_root, 'test_frame.jpg')
+        clean_path = os.path.join(self.repo_root, 'test_frame_clean.png')
+        if os.path.exists(clean_path):
+            self.image_path = clean_path
+        else:
+            self.image_path = os.path.join(self.repo_root, 'test_frame.jpg')
 
     def timer_callback(self):
         img = cv2.imread(self.image_path)
@@ -33,7 +37,10 @@ class ImageTester(Node):
             return
             
         # Ensure the image matches the TRT engine input dimensions (W=1920, H=1280)
-        img_resized = cv2.resize(img, (1920, 1280))
+        if img.shape[0] != 1280 or img.shape[1] != 1920:
+            img_resized = cv2.resize(img, (1920, 1280))
+        else:
+            img_resized = img
         
         # Convert OpenCV BGR to ROS 2 Image message
         msg = self.bridge.cv2_to_imgmsg(img_resized, encoding="bgr8")
