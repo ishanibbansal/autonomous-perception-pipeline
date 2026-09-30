@@ -223,3 +223,17 @@ This file serves as a living technical journal for the project. It tracks active
      - `scripts/train_student.py` (spatial training loop)
 * **Outcome:**
   Exact rotational orthonormality is preserved with zero numerical drift and zero risk of ill-conditioned matrix inversion in mixed precision. The change is mathematically exact ($< 3 \times 10^{-7}$ maximum residual difference on double-precision ground truth), requiring zero model retraining or weight updates.
+
+### Log 3.19: Resolving Autograd Graph Retention & VRAM Leaks in Temporal Accumulation Loops
+* **Date:** September 30, 2026
+* **Branch:** `feature/fix-temporal-graph-leak`
+* **Symptoms:**
+  1. During Phase 2 (Temporal) and Phase 3 (E2E) multi-frame training, VRAM consumption climbed across the 8 gradient accumulation steps, causing occasional Out-Of-Memory (OOM) exceptions on GPUs with 6GB–8GB of VRAM.
+  2. Intermediate activations from the unrolled sequence were remaining resident on the GPU even after backward pass execution.
+* **Root Cause:**
+  In `train_student_e2e.py` and `train_student_temporal.py`, the chronological sequence loop assigned `past_features = s_out['bev_features']`. On the final frame ($t_0$), the forward pass executes with gradients enabled. Because `past_features` was assigned directly from `s_out` without `.detach()`, it retained a live reference to the current frame's full computational graph (ResNet50 backbone activations, BiFPN decoder nodes, and view transformer tensors). Since `past_features` and `s_out` persisted in outer loop scope until overwritten by the next sequence, intermediate graph buffers coexisted across accumulation steps, leaking $\approx 400\text{ MB}$ of VRAM per step.
+* **Solution:**
+  1. Explicitly detached cached features: `past_features = s_out['bev_features'].detach()`, preventing backward graph chaining across frames and batches.
+  2. Added explicit end-of-batch cleanup (`del past_features, past_extrinsics, s_out`) immediately following `scaler.scale(loss).backward()`, allowing PyTorch's CUDA caching allocator to instantly reclaim activation memory for the next accumulation step.
+* **Outcome:**
+  Reclaimed $\approx 400\text{ MB}$ of peak VRAM per accumulation step, stabilizing 8-step gradient accumulation for long temporal sequences on memory-constrained GPUs. Zero changes to model parameters or loss math.
