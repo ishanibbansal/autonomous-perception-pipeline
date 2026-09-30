@@ -131,6 +131,24 @@ class LiftSplatViewTransformer(nn.Module):
         
         return bev_features, depth_logits
 
+def se3_inverse(T: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the exact closed-form inverse of batched SE(3) transformation matrices:
+    T = [[R, t], [0, 1]] -> T^(-1) = [[R^T, -R^T @ t], [0, 1]]
+    Preserves exact orthonormality and avoids numerical instability / precision loss from LU inversion.
+    Supports shape (..., 4, 4).
+    """
+    R = T[..., :3, :3]
+    t = T[..., :3, 3:4]
+    R_inv = R.transpose(-1, -2)
+    t_inv = -torch.matmul(R_inv, t)
+    
+    T_inv = torch.zeros_like(T)
+    T_inv[..., :3, :3] = R_inv
+    T_inv[..., :3, 3:4] = t_inv
+    T_inv[..., 3, 3] = 1.0
+    return T_inv
+
 class TemporalBEVFusion(nn.Module):
     """
     Memory-Safe Temporal Fusion Module (History Caching).
@@ -154,8 +172,8 @@ class TemporalBEVFusion(nn.Module):
         B, C, H, W = past_features.shape
         
         # 1. Compute relative transformation: T_rel = inv(T_current) @ T_past
-        # This tells us how the world moved relative to the ego-vehicle.
-        rel_transform = torch.inverse(current_extrinsic) @ past_extrinsic
+        # Closed-form SE(3) inverse avoids numerical drift and preserving exact rotation orthonormality.
+        rel_transform = se3_inverse(current_extrinsic) @ past_extrinsic
         
         affine_matrices = torch.zeros(B, 2, 3, device=past_features.device)
         
