@@ -203,7 +203,8 @@ def train_student_e2e(args):
                             past_extrinsics=past_extrinsics
                         )
                 
-                past_features = s_out['bev_features']
+                # Cache for the next loop iteration (detached to prevent gradient graph retention)
+                past_features = s_out['bev_features'].detach()
                 past_extrinsics = extrin
                 
                 if step == 0:
@@ -230,6 +231,9 @@ def train_student_e2e(args):
                         loss = total_loss / ACCUMULATION_STEPS
                     
                     scaler.scale(loss).backward()
+
+            # Clean up intermediate sequence tensors to free VRAM during gradient accumulation
+            del past_features, past_extrinsics, s_out
             
             if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(train_dataloader):
                 scaler.unscale_(optimizer)
