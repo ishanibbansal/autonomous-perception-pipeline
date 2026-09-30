@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.perception.models.teacher_bev import WaymoBEVDetector
-from src.perception.models.student_bev import StudentBEVDetector
+from src.perception.models.student_bev import StudentBEVDetector, se3_inverse
 from src.perception.losses.distill_loss import CrossModalDistillationLoss
 from src.perception.utils.dataset import WaymoTemporalDataset, temporal_collate_fn
 from src.perception.utils.target_encoder import BEVGridEncoder
@@ -58,7 +58,7 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                 cam = step_data['camera_images'].to(device, non_blocking=True)
                 intrin = step_data['intrinsics'].to(device, non_blocking=True)
                 extrin = step_data['extrinsics'].to(device, non_blocking=True)
-                extrin_inv = torch.inverse(extrin)
+                extrin_inv = se3_inverse(extrin)
                 
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     s_out = student(
@@ -184,7 +184,7 @@ def train_student_e2e(args):
                 cam = step_data['camera_images'].to(device, non_blocking=True)
                 intrin = step_data['intrinsics'].to(device, non_blocking=True)
                 extrin = step_data['extrinsics'].to(device, non_blocking=True)
-                extrin_inv = torch.inverse(extrin)
+                extrin_inv = se3_inverse(extrin)
                 
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     if step > 0:

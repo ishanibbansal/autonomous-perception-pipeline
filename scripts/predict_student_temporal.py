@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-from src.perception.models.student_bev import StudentBEVDetector
+from src.perception.models.student_bev import StudentBEVDetector, se3_inverse
 from src.perception.utils.dataset import WaymoTemporalDataset, temporal_collate_fn
 from src.perception.utils.target_encoder import BEVGridEncoder
 
@@ -55,7 +55,7 @@ def visualize_temporal(args):
                 cam = step_data['camera_images'].to(device)
                 intrin = step_data['intrinsics'].to(device)
                 extrin = step_data['extrinsics'].to(device)
-                extrin_inv = torch.inverse(extrin)
+                extrin_inv = se3_inverse(extrin)
                 
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     s_out = student(

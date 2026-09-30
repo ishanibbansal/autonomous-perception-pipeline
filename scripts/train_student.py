@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.perception.models.teacher_bev import WaymoBEVDetector
-from src.perception.models.student_bev import StudentBEVDetector
+from src.perception.models.student_bev import StudentBEVDetector, se3_inverse
 from src.perception.losses.distill_loss import CrossModalDistillationLoss
 from src.perception.utils.dataset import WaymoDataset, waymo_collate_fn
 from src.perception.utils.validate import validate_student
@@ -151,7 +151,7 @@ def train_student(args):
             intrinsics = batch['intrinsics'].to(device, non_blocking=True)
             extrinsics = batch['extrinsics'].to(device, non_blocking=True)
             
-            extrinsics_inv = torch.inverse(extrinsics)
+            extrinsics_inv = se3_inverse(extrinsics)
             depth_labels = batch['depth_labels'].to(device, non_blocking=True)
             
             encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
