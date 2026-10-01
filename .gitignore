@@ -5,13 +5,13 @@ env/
 venv/
 ENV/
 
-# Pycache & OS files
+# Python, Bytecode & OS files
 __pycache__/
 *.py[cod]
 .DS_Store
 *.deb
 
-# Waymo Data Files (CRITICAL)
+# Dataset Files
 data/
 *.tfrecord
 *.parquet
@@ -19,7 +19,7 @@ data/
 *.db3
 *.bag
 
-# Model Checkpoints & Weights
+# Model Checkpoints, Weights & Engines
 *.pth
 *.pt
 *.onnx
@@ -31,18 +31,17 @@ data/
 outputs/
 runs/
 
-# Image Files & Visualizations
+# Images & Visualizations
 *.jpg
 *.jpeg
 *.png
 
-# Jupyter Notebook Checkpoints
+# Notebooks & IDE Configurations
 .ipynb_checkpoints
-
-# VS Code Settings
 .vscode/
 
-# ROS 2 Build Artifacts
+# Build Artifacts (ROS 2, CMake & Benchmarking)
 build/
 install/
 log/
+scripts/benchmarks/eval_3d/results/
