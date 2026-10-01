@@ -3,12 +3,13 @@ import torch.nn.functional as F
 import math
 
 class CenterNetDecoder:
-    def __init__(self, x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160, threshold=0.35):
+    def __init__(self, x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160, threshold=0.35, min_radius=1.2):
         self.x_range = x_range
         self.y_range = y_range
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.threshold = threshold
+        self.min_radius = min_radius
         self.res_x = (x_range[1] - x_range[0]) / bev_h
         self.res_y = (y_range[1] - y_range[0]) / bev_w
         
@@ -91,7 +92,7 @@ class CenterNetDecoder:
                 })
                 
             # 3. Final Euclidean Sweep to collapse plateaus down to 1 box
-            filtered_boxes = self._radius_nms(boxes, min_radius=2.5)
+            filtered_boxes = self._radius_nms(boxes, min_radius=self.min_radius)
             batch_boxes.append(filtered_boxes)
             
         return batch_boxes

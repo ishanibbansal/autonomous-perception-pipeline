@@ -218,6 +218,23 @@ def compute_3d_iou_matrix(boxes_a, boxes_b):
     union = a_vol[:, None] + b_vol[None, :] - intersection
     return intersection / (union + 1e-6)
 
+def compute_center_distance_matrix(boxes_a, boxes_b):
+    """
+    Computes pairwise 2D L2 Euclidean distance between the centers of two sets of boxes.
+    boxes_a: [N, ...] where [:, 0] is X, [:, 1] is Y
+    boxes_b: [M, ...] where [:, 0] is X, [:, 1] is Y
+    Returns: [N, M] distance matrix
+    """
+    if len(boxes_a) == 0 or len(boxes_b) == 0:
+        return np.full((len(boxes_a), len(boxes_b)), fill_value=np.inf, dtype=np.float32)
+
+    centers_a = boxes_a[:, :2] # [N, 2]
+    centers_b = boxes_b[:, :2] # [M, 2]
+
+    diff = centers_a[:, None, :] - centers_b[None, :, :]
+    dist_matrix = np.linalg.norm(diff, axis=-1) # [N, M]
+    return dist_matrix
+
 
 def compute_ap(recalls, precisions):
     """
@@ -237,14 +254,14 @@ def compute_ap(recalls, precisions):
     return float(ap)
 
 
-def evaluate_detection_ap(predictions_by_frame, ground_truths_by_frame, iou_thresh=0.5, mode='3d'):
+def evaluate_detection_ap(predictions_by_frame, ground_truths_by_frame, metric_thresh=0.5, mode='3d'):
     """
     Evaluates dataset-wide AP for a given collection of predictions and ground truths.
 
     predictions_by_frame: dict {frame_idx: list of dicts [{'x', 'y', 'z', 'length', 'width', 'height', 'score'}]}
     ground_truths_by_frame: dict {frame_idx: list of dicts [{'x', 'y', 'z', 'length', 'width', 'height'}]}
-    iou_thresh: float (e.g. 0.5 or 0.7)
-    mode: '3d' or 'bev'
+    metric_thresh: float (IoU threshold for '3d'/'bev', or Distance threshold in meters for 'center_dist')
+    mode: '3d', 'bev', or 'center_dist'
     """
     # 1. Flatten all predictions with frame index
     all_preds = []
@@ -282,16 +299,26 @@ def evaluate_detection_ap(predictions_by_frame, ground_truths_by_frame, iou_thre
             pred_arr = np.array([[pred_box['x'], pred_box['y'], pred_box['length'], pred_box['width']]])
             gt_arr = np.array([[g['x'], g['y'], g['length'], g['width']] for g in gt_boxes])
             ious = compute_bev_iou_matrix(pred_arr, gt_arr)[0]
-        else:
+            best_gt_idx = int(np.argmax(ious))
+            best_metric = ious[best_gt_idx]
+            is_match = (best_metric >= metric_thresh)
+        elif mode == '3d':
             pred_arr = np.array([[pred_box['x'], pred_box['y'], pred_box['z'],
                                   pred_box['length'], pred_box['width'], pred_box['height']]])
             gt_arr = np.array([[g['x'], g['y'], g['z'], g['length'], g['width'], g['height']] for g in gt_boxes])
             ious = compute_3d_iou_matrix(pred_arr, gt_arr)[0]
+            best_gt_idx = int(np.argmax(ious))
+            best_metric = ious[best_gt_idx]
+            is_match = (best_metric >= metric_thresh)
+        else: # center_dist
+            pred_arr = np.array([[pred_box['x'], pred_box['y']]])
+            gt_arr = np.array([[g['x'], g['y']] for g in gt_boxes])
+            dists = compute_center_distance_matrix(pred_arr, gt_arr)[0]
+            best_gt_idx = int(np.argmin(dists))
+            best_metric = dists[best_gt_idx]
+            is_match = (best_metric <= metric_thresh)
 
-        best_gt_idx = int(np.argmax(ious))
-        best_iou = ious[best_gt_idx]
-
-        if best_iou >= iou_thresh and best_gt_idx not in matched_gt[f_idx]:
+        if is_match and best_gt_idx not in matched_gt[f_idx]:
             true_positives[i] = 1.0
             matched_gt[f_idx].add(best_gt_idx)
         else:
@@ -441,7 +468,8 @@ def main():
         y_range=(-40.0, 40.0),
         bev_h=160,
         bev_w=160,
-        threshold=args.score_thresh
+        threshold=args.score_thresh,
+        min_radius=args.min_radius
     )
 
     # 8. Accumulation Structures for Predictions & Ground Truths
@@ -605,11 +633,16 @@ def main():
         preds = preds_per_class[c_id]
         gts = gts_per_class[c_id]
 
-        bev_ap_50, tp_bev_50, total_gt = evaluate_detection_ap(preds, gts, iou_thresh=0.5, mode='bev')
-        bev_ap_70, tp_bev_70, _ = evaluate_detection_ap(preds, gts, iou_thresh=0.7, mode='bev')
+        bev_ap_50, _, total_gt = evaluate_detection_ap(preds, gts, metric_thresh=0.5, mode='bev')
+        bev_ap_70, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=0.7, mode='bev')
 
-        iou_3d_50, tp_3d_50, _ = evaluate_detection_ap(preds, gts, iou_thresh=0.5, mode='3d')
-        iou_3d_70, tp_3d_70, _ = evaluate_detection_ap(preds, gts, iou_thresh=0.7, mode='3d')
+        iou_3d_50, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=0.5, mode='3d')
+        iou_3d_70, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=0.7, mode='3d')
+
+        cdist_05, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=0.5, mode='center_dist')
+        cdist_10, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=1.0, mode='center_dist')
+        cdist_20, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=2.0, mode='center_dist')
+        cdist_40, _, _ = evaluate_detection_ap(preds, gts, metric_thresh=4.0, mode='center_dist')
 
         metrics_summary[c_name] = {
             'class_id': c_id,
@@ -617,26 +650,31 @@ def main():
             'bev_ap_0.5': bev_ap_50,
             'bev_ap_0.7': bev_ap_70,
             '3d_ap_0.5': iou_3d_50,
-            '3d_ap_0.7': iou_3d_70
+            '3d_ap_0.7': iou_3d_70,
+            'cdist_ap_0.5m': cdist_05,
+            'cdist_ap_1.0m': cdist_10,
+            'cdist_ap_2.0m': cdist_20,
+            'cdist_ap_4.0m': cdist_40
         }
 
     # 10. Display Summary Table
-    print("\n" + "=" * 90)
-    print("                      3D OBJECT DETECTION EVALUATION RESULTS")
-    print("=" * 90)
-    print(f"{'Class':<22} | {'GT Count':<9} | {'BEV AP@0.5':<11} | {'BEV AP@0.7':<11} | {'3D AP@0.5':<11} | {'3D AP@0.7':<11}")
-    print("-" * 90)
+    print("\n" + "=" * 128)
+    print("                                      3D OBJECT DETECTION EVALUATION RESULTS (WITH NDS METRICS)")
+    print("=" * 128)
+    print(f"{'Class':<22} | {'GT Count':<9} | {'BEV AP@0.5':<10} | {'3D AP@0.5':<10} | {'CD AP@0.5m':<10} | {'CD AP@1.0m':<10} | {'CD AP@2.0m':<10} | {'CD AP@4.0m':<10}")
+    print("-" * 128)
 
     for c_id, c_name in eval_classes:
         m = metrics_summary[c_name]
         is_overall = (c_id == 0)
         if is_overall:
-            print("-" * 90)
+            print("-" * 128)
         print(
-            f"{c_name:<22} | {m['gt_count']:<9d} | {m['bev_ap_0.5']:<11.4f} | "
-            f"{m['bev_ap_0.7']:<11.4f} | {m['3d_ap_0.5']:<11.4f} | {m['3d_ap_0.7']:<11.4f}"
+            f"{c_name:<22} | {m['gt_count']:<9d} | {m['bev_ap_0.5']:<10.4f} | "
+            f"{m['3d_ap_0.5']:<10.4f} | {m['cdist_ap_0.5m']:<10.4f} | "
+            f"{m['cdist_ap_1.0m']:<10.4f} | {m['cdist_ap_2.0m']:<10.4f} | {m['cdist_ap_4.0m']:<10.4f}"
         )
-    print("=" * 90 + "\n")
+    print("=" * 128 + "\n")
 
     # 11. Optionally Save Results to JSON
     if args.save_results:

@@ -237,3 +237,39 @@ This file serves as a living technical journal for the project. It tracks active
   2. Added explicit end-of-batch cleanup (`del past_features, past_extrinsics, s_out`) immediately following `scaler.scale(loss).backward()`, allowing PyTorch's CUDA caching allocator to instantly reclaim activation memory for the next accumulation step.
 * **Outcome:**
   Reclaimed $\approx 400\text{ MB}$ of peak VRAM per accumulation step, stabilizing 8-step gradient accumulation for long temporal sequences on memory-constrained GPUs. Zero changes to model parameters or loss math.
+
+### Log 3.20: Comprehensive Benchmarking Suite & Monocular 3D Localization Validation
+* **Date:** September 30, 2026
+* **Branch:** `feature/benchmarking-suite`
+* **Objective:**
+  Build a production-grade, end-to-end benchmarking suite for both hardware inference latency and multi-class 3D geometric accuracy across the Waymo Open Dataset (WOD), evaluating both the Student and Teacher models without external runtime dependencies (e.g., Waymo protobufs or TensorFlow).
+* **Architecture & Implementation:**
+  1. **C++ TensorRT Latency Profiler (`scripts/benchmarks/latency_trt/`):**
+     - Implemented native C++ inference profiler using TensorRT 10/11 v3 APIs (`enqueueV3`, `setTensorAddress`).
+     - Added dynamic binding discovery, CUDA event timing (`cudaEventRecord`), warm-up cycles, and percentile latency tracking (P50, P90, P95, P99).
+     - Automated build configuration via `CMakeLists.txt` and `compile_benchmark.sh`.
+     - **Empirical Results (`student_bev.engine` on NVIDIA GeForce RTX 2060):**
+       - Mean Latency: $54.08\text{ ms}$ ($18.5\text{ FPS}$)
+       - P50: $54.09\text{ ms}$ | P95: $54.32\text{ ms}$ | P99: $54.36\text{ ms}$
+       - Successfully met the $\le 100\text{ ms}$ ($10\text{ Hz}$) real-time AV budget.
+  2. **Standalone 3D Object Detection Evaluator (`scripts/benchmarks/eval_3d/evaluate_3d_detection.py`):**
+     - Pure PyTorch/NumPy evaluation harness supporting both Teacher (`WaymoBEVDetector`) and Student (`StudentBEVDetector`) architectures.
+     - Implemented 11-point interpolated Average Precision (AP) for 2D BEV and 3D Axis-Aligned Volumetric IoU at 0.5 and 0.7 thresholds.
+     - Integrated sequential multi-frame evaluation ($t_{-2} \to t_{-1} \to t_0$) with closed-form SE(3) ego-motion alignment.
+  3. **nuScenes-Style Center-Distance (NDS Translation Error) Metrics:**
+     - Heatmap analysis revealed that the model accurately projects top-down vehicle center-masses, but strict volumetric IoU penalized under-trained bounding box regression heads (dimensions and heading).
+     - Implemented 2D Euclidean center-distance matching using nuScenes Detection Score (NDS) translation cutoffs: $0.5\text{m}$, $1.0\text{m}$, $2.0\text{m}$, and $4.0\text{m}$.
+     - Refactored `CenterNetDecoder` in `src/perception/utils/nms_decoder.py` to use a configurable `min_radius` (reduced default from an aggressive $2.5\text{m}$ to $1.2\text{m}$) to prevent suppression of adjacent vehicles in tight traffic.
+* **Empirical Validation (Teacher Baseline on 991 Validation Frames / 15,393 GT Objects):**
+  - **Vehicle (Car):**
+    - 3D AP@0.5: **3.63%**
+    - BEV AP@0.5: **7.22%**
+    - Center-Distance AP@0.5m: **3.66%**
+    - Center-Distance AP@1.0m: **10.81%**
+    - Center-Distance AP@2.0m: **16.88%**
+    - Center-Distance AP@4.0m: **20.84%**
+  - **Pedestrian:** 3D AP@0.5: **0.14%** | BEV AP@0.5: **1.01%** | CD AP@4.0m: **2.69%**
+  - **Cyclist:** 3D AP@0.5: **0.00%** | BEV AP@0.5: **0.73%** | CD AP@4.0m: **0.73%**
+* **Key Findings & Next Steps:**
+  - The **20.84%** CD AP@4.0m aligns with the $\approx 20\%$ occupancy accuracy recorded during training, validating that 2D-to-BEV view projection and temporal ego-motion fusion function effectively.
+  - The discrepancy between center-distance accuracy ($20.84\%$) and volumetric IoU ($3.63\%$) confirms that the spatial projection is sound, with bounding-box regression heads (dimensions and orientation) serving as the primary bottleneck to be addressed in future training iterations.
