@@ -40,7 +40,7 @@ class ModelEMA:
                 else:
                     esd[k].copy_(msd[k])
 
-def validate_temporal(student, teacher, dataloader, criterion, encoder, device, seq_length=3):
+def validate_temporal(student, teacher, dataloader, criterion, encoder, device, seq_length=3, max_batches=None):
     student.eval()
     val_loss_total = 0.0
     total_intersection = 0.0
@@ -48,6 +48,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
+            if max_batches is not None and (batch_idx + 1) > max_batches:
+                break
             past_features = None
             past_extrinsics = None
             
@@ -78,7 +80,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                     val_depths = step_data['depth_labels'].to(device, non_blocking=True)
                     
                     encoded = encoder.encode(step_data['bboxes'], step_data['num_valid_boxes'])
-                    val_gt = encoded['bev_occupancy'].to(device, non_blocking=True)
+                    val_targets = {k: v.to(device, non_blocking=True) for k, v in encoded.items()}
+                    val_gt = val_targets['bev_occupancy']
 
                     with torch.amp.autocast('cuda', dtype=torch.float16):
                         t_out = teacher(val_lidar, val_indices, cam, val_uvs)
@@ -89,7 +92,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                             s_out, t_feat, 
                             ground_truth=val_gt, 
                             teacher_logits=None, 
-                            depth_labels=val_depths
+                            depth_labels=val_depths,
+                            targets=val_targets
                         )
                     
                     val_loss_total += v_dict['loss_total']
@@ -102,7 +106,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                     total_intersection += intersection.item()
                     total_union += union.item()
                     
-    return val_loss_total / len(dataloader), total_intersection / (total_union + 1e-6)
+    num_eval = (batch_idx + 1) if max_batches is not None and (batch_idx + 1) <= max_batches else len(dataloader)
+    return val_loss_total / max(1, num_eval), total_intersection / (total_union + 1e-6)
 
 def train_student_e2e(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -226,7 +231,8 @@ def train_student_e2e(args):
 
                         total_loss, loss_dict = criterion(
                             s_out, t_feat, ground_truth=targets_gpu['bev_occupancy'],
-                            teacher_logits=t_logits, depth_labels=depth_labels
+                            teacher_logits=t_logits, depth_labels=depth_labels,
+                            targets=targets_gpu
                         )
                         loss = total_loss / ACCUMULATION_STEPS
                     
@@ -235,7 +241,8 @@ def train_student_e2e(args):
             # Clean up intermediate sequence tensors to free VRAM during gradient accumulation
             del past_features, past_extrinsics, s_out
             
-            if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(train_dataloader):
+            effective_total_batches = min(len(train_dataloader), args.max_batches) if args.max_batches is not None else len(train_dataloader)
+            if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == effective_total_batches:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=2.0)
                 scaler.step(optimizer)
@@ -246,15 +253,20 @@ def train_student_e2e(args):
             true_loss = loss.item() * ACCUMULATION_STEPS
             epoch_train_loss += true_loss
             
-            if batch_idx % 10 == 0:
+            if batch_idx % 10 == 0 or (batch_idx + 1) == effective_total_batches:
                 sec_per_batch = (time.time() - batch_start_time) / (1 if batch_idx == 0 else 10)
-                print(f"Epoch {epoch + 1:02d} | Batch {batch_idx:03d} | Total Loss: {true_loss:.4f} | Speed: {sec_per_batch:.3f} s/b")
+                print(f"Epoch {epoch + 1:02d} | Batch {batch_idx:03d} | Total: {true_loss:.4f} (Det: {loss_dict['loss_det']:.3f}, Reg: {loss_dict['loss_reg']:.3f}, Dim: {loss_dict['loss_dim']:.3f}, Ori: {loss_dict['loss_ori']:.3f}) | Speed: {sec_per_batch:.3f} s/b")
                 batch_start_time = time.time()
+                
+            if args.max_batches is not None and (batch_idx + 1) >= args.max_batches:
+                print(f"--> Reached max batches limit ({args.max_batches}). Stopping epoch early.")
+                break
                 
         scheduler.step()
         
-        avg_val_loss, val_score = validate_temporal(student, teacher, val_dataloader, criterion, encoder, device, args.seq_length)
-        print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {epoch_train_loss/len(train_dataloader):.4f} | EMA Val Score: {val_score:.4f}")
+        avg_val_loss, val_score = validate_temporal(student, teacher, val_dataloader, criterion, encoder, device, args.seq_length, max_batches=args.max_batches)
+        batches_run = effective_total_batches if args.max_batches is not None else len(train_dataloader)
+        print(f"Epoch {epoch + 1:02d}/{epochs} | Train Loss: {epoch_train_loss/max(1, batches_run):.4f} | EMA Val Score: {val_score:.4f}")
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -267,6 +279,10 @@ def train_student_e2e(args):
             best_val_score = val_score
             torch.save(checkpoint, args.best_ckpt_name)
             print(f"--> [NEW BEST] Saved E2E Model with Val Score: {val_score:.4f}")
+            
+        if args.max_batches is not None:
+            print("--> Completed max_batches sanity run. Exiting.")
+            break
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Phase 3: E2E Student Fine-Tuning')
@@ -275,6 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_dir', type=str, default='runs/e2e_student_01')
     parser.add_argument('--best_ckpt_name', type=str, default='best_e2e_student_checkpoint.pt')
     parser.add_argument('--seq_length', type=int, default=3, help='Must match Phase 2')
+    parser.add_argument('--max-batches', type=int, default=None, help='Limit batches per epoch for sanity checking')
     args = parser.parse_args()
     
     mp.set_start_method('spawn', force=True)

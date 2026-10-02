@@ -3,15 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class CrossModalDistillationLoss(nn.Module):
-    def __init__(self, alpha_feat=0.1, alpha_logit=1.0, alpha_depth=0.1, focal_alpha=2.0, focal_beta=4.0):
+    def __init__(self, alpha_feat=0.1, alpha_logit=1.0, alpha_depth=0.1, 
+                 alpha_dim=2.0, alpha_ori=1.0, alpha_offset=1.0,
+                 focal_alpha=2.0, focal_beta=4.0):
         super().__init__()
         self.alpha_feat = alpha_feat
         self.alpha_logit = alpha_logit
         self.alpha_depth = alpha_depth
+        self.alpha_dim = alpha_dim
+        self.alpha_ori = alpha_ori
+        self.alpha_offset = alpha_offset
         self.focal_alpha = focal_alpha
         self.focal_beta = focal_beta
         
         self.feature_loss = nn.SmoothL1Loss(reduction='none')
+        self.regression_loss = nn.SmoothL1Loss(reduction='none')
         self.logit_loss = nn.MSELoss(reduction='none')
         self.depth_loss = nn.CrossEntropyLoss(ignore_index=-1) 
         
@@ -52,23 +58,30 @@ class CrossModalDistillationLoss(nn.Module):
         dice = 1.0 - (2.0 * intersection + smooth) / (union + smooth)
         return dice.mean()
 
-    def forward(self, student_outputs, teacher_features, ground_truth, teacher_logits=None, depth_labels=None):
+    def forward(self, student_outputs, teacher_features, ground_truth, teacher_logits=None, depth_labels=None, targets=None):
+        if isinstance(ground_truth, dict):
+            if targets is None:
+                targets = ground_truth
+            ground_truth = ground_truth['bev_occupancy']
+
         student_features = student_outputs['bev_features'].float()
         student_occupancy = student_outputs['bev_occupancy'].float()
-        teacher_features = teacher_features.float()
         ground_truth = ground_truth.float()
         
         b_size = student_occupancy.shape[0]
         fov_mask = self.fov_mask.expand(b_size, -1, -1, -1).float()
         
-        # 1. Ground Truth Hard Losses
+        # 1. Ground Truth Hard Losses (Heatmap Objectness)
         loss_focal = self.centernet_focal_loss(student_occupancy, ground_truth, fov_mask)
         loss_dice = self.dice_loss(student_occupancy, ground_truth, fov_mask)
         loss_det = loss_focal + loss_dice
         
         # 2. Feature Distillation
-        feat_err = self.feature_loss(student_features, teacher_features.detach())
-        loss_feat = (feat_err * fov_mask).sum() / (fov_mask.sum() * student_features.shape[1] + 1e-6)
+        loss_feat = torch.tensor(0.0, device=student_occupancy.device, dtype=torch.float32)
+        if teacher_features is not None:
+            teacher_features = teacher_features.float()
+            feat_err = self.feature_loss(student_features, teacher_features.detach())
+            loss_feat = (feat_err * fov_mask).sum() / (fov_mask.sum() * student_features.shape[1] + 1e-6)
         
         # 3. Soft Logit Distillation (Only computed if logits are provided)
         loss_logit = torch.tensor(0.0, device=student_occupancy.device, dtype=torch.float32)
@@ -82,12 +95,45 @@ class CrossModalDistillationLoss(nn.Module):
         if 'depth_logits' in student_outputs and depth_labels is not None:
             loss_depth = self.depth_loss(student_outputs['depth_logits'], depth_labels)
 
-        total_loss = loss_det + (self.alpha_feat * loss_feat) + (self.alpha_logit * loss_logit) + (self.alpha_depth * loss_depth)
+        # 5. Bounding Box Regression Losses (Dimensions, Orientation, Offset)
+        loss_dim = torch.tensor(0.0, device=student_occupancy.device, dtype=torch.float32)
+        loss_ori = torch.tensor(0.0, device=student_occupancy.device, dtype=torch.float32)
+        loss_offset = torch.tensor(0.0, device=student_occupancy.device, dtype=torch.float32)
+        
+        if targets is not None and 'mask' in targets:
+            mask = targets['mask'].float()
+            active_mask = mask * fov_mask
+            mask_sum = torch.clamp(active_mask.sum(), min=1.0)
+            
+            if 'dimensions' in student_outputs and 'dimensions' in targets:
+                dim_err = self.regression_loss(student_outputs['dimensions'].float(), targets['dimensions'].float())
+                loss_dim = (dim_err * active_mask).sum() / mask_sum
+                
+            if 'orientation' in student_outputs and 'orientation' in targets:
+                ori_err = self.regression_loss(student_outputs['orientation'].float(), targets['orientation'].float())
+                loss_ori = (ori_err * active_mask).sum() / mask_sum
+                
+            if 'offset' in student_outputs and 'offset' in targets:
+                offset_err = self.regression_loss(student_outputs['offset'].float(), targets['offset'].float())
+                loss_offset = (offset_err * active_mask).sum() / mask_sum
+
+        loss_reg = (self.alpha_dim * loss_dim) + (self.alpha_ori * loss_ori) + (self.alpha_offset * loss_offset)
+        total_loss = (
+            loss_det
+            + (self.alpha_feat * loss_feat)
+            + (self.alpha_logit * loss_logit)
+            + (self.alpha_depth * loss_depth)
+            + loss_reg
+        )
 
         return total_loss, {
             'loss_total': total_loss.item(),
             'loss_det': loss_det.item(),
             'loss_feat': loss_feat.item(),
             'loss_logit': loss_logit.item(),
-            'loss_depth': loss_depth.item()
+            'loss_depth': loss_depth.item(),
+            'loss_dim': loss_dim.item(),
+            'loss_ori': loss_ori.item(),
+            'loss_offset': loss_offset.item(),
+            'loss_reg': loss_reg.item()
         }

@@ -273,3 +273,26 @@ This file serves as a living technical journal for the project. It tracks active
 * **Key Findings & Next Steps:**
   - The **20.84%** CD AP@4.0m aligns with the $\approx 20\%$ occupancy accuracy recorded during training, validating that 2D-to-BEV view projection and temporal ego-motion fusion function effectively.
   - The discrepancy between center-distance accuracy ($20.84\%$) and volumetric IoU ($3.63\%$) confirms that the spatial projection is sound, with bounding-box regression heads (dimensions and orientation) serving as the primary bottleneck to be addressed in future training iterations.
+
+### Log 3.21: Student Distillation Loss Repair (Phase 2)
+* **Date:** October 2, 2026
+* **Branch:** `feature/student-distillation-loss`
+* **Objective:**
+  Resolve the architectural flaw where `CrossModalDistillationLoss` completely omitted bounding box regression supervision (`dimensions`, `orientation`, `offset`), causing the student's regression heads to remain untrained during distillation.
+* **Architecture & Implementation:**
+  1. **Multi-Head Regression Distillation (`src/perception/losses/distill_loss.py`):**
+     - Enhanced `CrossModalDistillationLoss` with `SmoothL1Loss` regression metrics for 3D bounding box attributes: `dimensions` ($3$ channels), `orientation` ($2$ channels: $\sin \theta, \cos \theta$), and sub-pixel CenterPoint `offset` ($2$ channels: $dx, dy$).
+     - Applied active spatial masking ($M_{\text{active}} = M_{\text{target}} \odot M_{\text{FOV}}$) to strictly penalize bounding box errors within the valid front camera field-of-view.
+     - Added configurable loss multipliers aligned with CenterNet standards: $\alpha_{\text{dim}} = 2.0$, $\alpha_{\text{ori}} = 1.0$, and $\alpha_{\text{offset}} = 1.0$.
+     - Preserved full backward compatibility with legacy single-tensor `ground_truth` inputs while supporting target dictionaries (`targets_gpu`).
+  2. **Pipeline Integration (`scripts/train_student_e2e.py`, `scripts/train_student_temporal.py`, `scripts/train_student.py`):**
+     - Updated training and validation loops to supply `targets=targets_gpu` to `criterion()`.
+     - Added `--max-batches` argument to `train_student_e2e.py` for rapid sanity checks and autograd graph validation.
+     - Enhanced training console logging with decoupled detection (`loss_det`), regression (`loss_reg`), dimension (`loss_dim`), and orientation (`loss_ori`) telemetry.
+* **Empirical Validation:**
+  - **Unit Testing (`tests/test_distill_loss.py`):**
+    - Verified backward compatibility with single occupancy tensor inputs.
+    - Verified active gradient flow into `student_outputs['dimensions']`, `student_outputs['orientation']`, and `student_outputs['offset']` with non-zero gradients on masked targets.
+  - **E2E 1-Batch Integration Test (`scripts/train_student_e2e.py --max-batches 1`):**
+    - `Batch 000 | Total: 22.8430 (Det: 5.936, Reg: 4.817, Dim: 2.008, Ori: 0.704)`
+    - Successfully validated the entire FP16 mixed precision autocast, gradient scaler unscaling, gradient clipping, optimizer step, and EMA state update on CUDA without graph retention or memory leaks.
