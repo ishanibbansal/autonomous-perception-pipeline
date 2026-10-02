@@ -176,7 +176,8 @@ def train_student(args):
                     teacher_features, 
                     ground_truth=targets_gpu['bev_occupancy'],
                     teacher_logits=teacher_logits,
-                    depth_labels=depth_labels
+                    depth_labels=depth_labels,
+                    targets=targets_gpu
                 )
                 loss = total_loss / ACCUMULATION_STEPS
             

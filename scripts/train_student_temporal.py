@@ -81,7 +81,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                     val_depths = step_data['depth_labels'].to(device, non_blocking=True)
                     
                     encoded = encoder.encode(step_data['bboxes'], step_data['num_valid_boxes'])
-                    val_gt = encoded['bev_occupancy'].to(device, non_blocking=True)
+                    val_targets = {k: v.to(device, non_blocking=True) for k, v in encoded.items()}
+                    val_gt = val_targets['bev_occupancy']
 
                     with torch.amp.autocast('cuda', dtype=torch.float16):
                         t_out = teacher(val_lidar, val_indices, cam, val_uvs)
@@ -92,7 +93,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                             s_out, t_feat, 
                             ground_truth=val_gt, 
                             teacher_logits=None, 
-                            depth_labels=val_depths
+                            depth_labels=val_depths,
+                            targets=val_targets
                         )
                     
                     val_loss_total += v_dict['loss_total']
@@ -235,7 +237,8 @@ def train_student_temporal(args):
 
                         total_loss, loss_dict = criterion(
                             s_out, t_feat, ground_truth=targets_gpu['bev_occupancy'],
-                            teacher_logits=t_logits, depth_labels=depth_labels
+                            teacher_logits=t_logits, depth_labels=depth_labels,
+                            targets=targets_gpu
                         )
                         loss = total_loss / ACCUMULATION_STEPS
                     
