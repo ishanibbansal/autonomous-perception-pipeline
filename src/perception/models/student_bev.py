@@ -28,10 +28,11 @@ class SEBlock(nn.Module):
 class LiftSplatViewTransformer(nn.Module):
     def __init__(self, in_channels=256, out_channels=64, bev_h=160, bev_w=160, 
                  d_min=2.0, d_max=50.0, d_bins=48, 
-                 x_range=(0.0, 70.0), y_range=(-40.0, 40.0)):
+                 x_range=(0.0, 70.0), y_range=(-40.0, 40.0), legacy_frame=True):
         super().__init__()
         self.bev_h = bev_h
         self.bev_w = bev_w
+        self.legacy_frame = legacy_frame
         self.d_min = d_min
         self.d_max = d_max
         self.d_bins = d_bins
@@ -92,11 +93,16 @@ class LiftSplatViewTransformer(nn.Module):
         geom = geom.reshape(B, -1, 3)
         volume = volume.float().reshape(B, -1, C) 
         
-        x_idx = ((geom[..., 0] - self.x_min) / self.x_step).long()
-        y_idx = ((geom[..., 1] - self.y_min) / self.y_step).long()
-        
-        x_idx = (self.bev_h - 1) - x_idx
-        y_idx = (self.bev_w - 1) - y_idx
+        if self.legacy_frame:
+            # Saved student checkpoints used truncating invert, which is off by up to one cell
+            # from floor((bev - 1) - (coord - min) / res).
+            x_idx = ((geom[..., 0] - self.x_min) / self.x_step).long()
+            y_idx = ((geom[..., 1] - self.y_min) / self.y_step).long()
+            x_idx = (self.bev_h - 1) - x_idx
+            y_idx = (self.bev_w - 1) - y_idx
+        else:
+            x_idx = torch.floor((self.bev_h - 1) - (geom[..., 0] - self.x_min) / self.x_step).long()
+            y_idx = torch.floor((self.bev_w - 1) - (geom[..., 1] - self.y_min) / self.y_step).long()
         
         valid_mask = (x_idx >= 0) & (x_idx < self.bev_h) & \
                      (y_idx >= 0) & (y_idx < self.bev_w) & \
@@ -130,6 +136,36 @@ class LiftSplatViewTransformer(nn.Module):
         bev_features = self.voxel_pooling(geom, volume)
         
         return bev_features, depth_logits
+
+def canonical_pose_sample_grid(batch, height, width, current_pose, past_pose, x_range=(0.0, 70.0), y_range=(-40.0, 40.0)):
+    """
+    grid_sample coordinates that pull current BEV cells back into the past vehicle frame.
+
+    T_rel = se3_inverse(past_pose) @ current_pose maps a point in the current vehicle
+    frame into the past vehicle frame. Cell centers use (grid_size - 1.5 - index) * res + min.
+    The returned grid is normalized with align_corners=False.
+    """
+    device = current_pose.device
+    dtype = current_pose.dtype
+    rows = torch.arange(height, device=device, dtype=dtype)
+    cols = torch.arange(width, device=device, dtype=dtype)
+    row_grid, col_grid = torch.meshgrid(rows, cols, indexing='ij')
+    res_x = (x_range[1] - x_range[0]) / height
+    res_y = (y_range[1] - y_range[0]) / width
+    x = ((height - 1.5 - row_grid) * res_x) + x_range[0]
+    y = ((width - 1.5 - col_grid) * res_y) + y_range[0]
+    ones = torch.ones_like(x)
+    zeros = torch.zeros_like(x)
+    points = torch.stack([x, y, zeros, ones], dim=-1).view(1, height * width, 4, 1)
+    points = points.expand(batch, -1, -1, -1)
+    rel = se3_inverse(past_pose) @ current_pose
+    past_pts = (rel.view(batch, 1, 4, 4) @ points).squeeze(-1)
+    past_index_x = (height - 1.5) - (past_pts[..., 0] - x_range[0]) / res_x
+    past_index_y = (width - 1.5) - (past_pts[..., 1] - y_range[0]) / res_y
+    grid_x = 2.0 * (past_index_y + 0.5) / width - 1.0
+    grid_y = 2.0 * (past_index_x + 0.5) / height - 1.0
+    return torch.stack([grid_x, grid_y], dim=-1).view(batch, height, width, 2)
+
 
 def se3_inverse(T: torch.Tensor) -> torch.Tensor:
     """
@@ -168,7 +204,11 @@ class TemporalBEVFusion(nn.Module):
         self.x_extent = 70.0  # 0 to 70m
         self.y_extent = 80.0  # -40 to 40m (total 80m span)
 
-    def align_past_features(self, past_features, current_extrinsic, past_extrinsic):
+    def align_past_features(self, past_features, current_extrinsic, past_extrinsic, current_pose=None, past_pose=None):
+        if current_pose is not None and past_pose is not None:
+            return self._align_with_pose(past_features, current_pose, past_pose)
+        # Legacy eval path. evaluate_3d_detection.py does not pass poses, so the
+        # 991-frame student number still uses this extrinsic affine warp.
         B, C, H, W = past_features.shape
         
         # 1. Compute relative transformation: T_rel = inv(T_current) @ T_past
@@ -206,7 +246,19 @@ class TemporalBEVFusion(nn.Module):
         
         return aligned_past
 
-    def forward(self, current_features, past_features, current_extrinsic, past_extrinsic):
+    def _align_with_pose(self, past_features, current_pose, past_pose):
+        grid = canonical_pose_sample_grid(
+            past_features.shape[0],
+            past_features.shape[2],
+            past_features.shape[3],
+            current_pose,
+            past_pose,
+            x_range=(0.0, 70.0),
+            y_range=(-40.0, 40.0),
+        )
+        return F.grid_sample(past_features, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+    def forward(self, current_features, past_features, current_extrinsic, past_extrinsic, current_pose=None, past_pose=None):
         if past_features is None:
             # If there is no history (e.g., the very first frame of a sequence), 
             # pad with a blank zero-tensor of the exact same shape.
@@ -217,7 +269,10 @@ class TemporalBEVFusion(nn.Module):
             past_features = past_features.detach()
             
             # Physically rotate and shift the past feature map to match current ego-position
-            aligned_past = self.align_past_features(past_features, current_extrinsic, past_extrinsic)
+            aligned_past = self.align_past_features(
+                past_features, current_extrinsic, past_extrinsic,
+                current_pose=current_pose, past_pose=past_pose,
+            )
 
         # Concatenate along the channel dimension (e.g., 64 + 64 = 128)
         fused = torch.cat([current_features, aligned_past], dim=1)
@@ -226,9 +281,10 @@ class TemporalBEVFusion(nn.Module):
         return self.fusion_conv(fused)
 
 class StudentBEVDetector(nn.Module):
-    def __init__(self, bev_h=160, bev_w=160, feature_channels=64, use_temporal=False):
+    def __init__(self, bev_h=160, bev_w=160, feature_channels=64, use_temporal=False, legacy_frame=True, positive_dims=False):
         super().__init__()
         self.use_temporal = use_temporal
+        self.legacy_frame = legacy_frame
         
         resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
         self.backbone_stem = nn.Sequential(
@@ -241,7 +297,8 @@ class StudentBEVDetector(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.view_transformer = LiftSplatViewTransformer(
-            in_channels=256, out_channels=feature_channels, bev_h=bev_h, bev_w=bev_w
+            in_channels=256, out_channels=feature_channels, bev_h=bev_h, bev_w=bev_w,
+            legacy_frame=legacy_frame,
         )
         
         # 1. Feature Adaptation Layer
@@ -258,9 +315,9 @@ class StudentBEVDetector(nn.Module):
         if self.use_temporal:
             self.temporal_fusion = TemporalBEVFusion(in_channels=feature_channels)
             
-        self.bev_head = BiFPNBEVDecoder(in_channels=feature_channels)
+        self.bev_head = BiFPNBEVDecoder(in_channels=feature_channels, positive_dims=positive_dims)
 
-    def forward(self, camera_images, intrinsics, extrinsics_inv, past_features=None, current_extrinsics=None, past_extrinsics=None):
+    def forward(self, camera_images, intrinsics, extrinsics_inv, past_features=None, current_extrinsics=None, past_extrinsics=None, current_pose=None, past_pose=None):
         x = self.backbone_stem(camera_images)
         x = self.reduce_channel(x)
         
@@ -275,7 +332,9 @@ class StudentBEVDetector(nn.Module):
                 current_features=cleaned_features,
                 past_features=past_features,
                 current_extrinsic=current_extrinsics,
-                past_extrinsic=past_extrinsics
+                past_extrinsic=past_extrinsics,
+                current_pose=current_pose,
+                past_pose=past_pose,
             )
         else:
             fused_features = cleaned_features

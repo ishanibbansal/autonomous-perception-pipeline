@@ -29,7 +29,9 @@ def train_model(args):
     print(f"TensorBoard initialized. Run 'tensorboard --logdir={args.log_dir}' to view.")
 
     # --- Initialize Model ---
-    model = WaymoBEVDetector().to(device)
+    # Future runs train in the canonical frame. Do not resume best_waymo_bev_checkpoint.pt into this geometry.
+    model = WaymoBEVDetector(legacy_frame=False, positive_dims=True).to(device)
+    print("Teacher frame: legacy_frame=False, positive_dims=True, point_cloud_range Z=[-2, 4]")
 
     # --- Initialize the Master Pipeline Loss ---
     criterion = WaymoDetectionLoss().to(device)
@@ -58,7 +60,7 @@ def train_model(args):
     if not val_files:
         raise FileNotFoundError("No .tfrecord files found in data/raw/val/")
 
-    train_datasets = [WaymoDataset(tfrecord_path=f, is_train=True) for f in train_files]
+    train_datasets = [WaymoDataset(tfrecord_path=f, is_train=True, num_sweeps=1) for f in train_files]
     train_dataset = ConcatDataset(train_datasets)
     
     train_dataloader = DataLoader(
@@ -72,7 +74,7 @@ def train_model(args):
         prefetch_factor=2            
     )
     
-    val_datasets = [WaymoDataset(tfrecord_path=f, is_train=False) for f in val_files]
+    val_datasets = [WaymoDataset(tfrecord_path=f, is_train=False, num_sweeps=1) for f in val_files]
     val_dataset = ConcatDataset(val_datasets)
     
     val_dataloader = DataLoader(
@@ -131,7 +133,8 @@ def train_model(args):
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 predictions = model(lidar_points, batch_indices, camera_images, lidar_uvs)
                 
-                total_loss = criterion(predictions, targets_gpu)
+                loss_dict = criterion(predictions, targets_gpu)
+                total_loss = loss_dict['loss_total']
                 loss = total_loss / ACCUMULATION_STEPS
             
             scaler.scale(loss).backward()
@@ -162,7 +165,11 @@ def train_model(args):
                 elapsed_time = time.time() - batch_start_time
                 batches_processed = 1 if batch_idx == 0 else 10
                 sec_per_batch = elapsed_time / batches_processed
-                print(f"Epoch {epoch + 1:02d}/{epochs} | Batch {batch_idx:03d} | Loss: {true_loss:.4f} | Speed: {sec_per_batch:.3f} sec/batch")
+                print(
+                    f"Epoch {epoch + 1:02d}/{epochs} | Batch {batch_idx:03d} | Loss: {true_loss:.4f} | "
+                    f"Focal: {loss_dict['loss_focal'].item():.4f} | Dim: {loss_dict['loss_dim'].item():.4f} | "
+                    f"Speed: {sec_per_batch:.3f} sec/batch"
+                )
                 batch_start_time = time.time()
                 
         with warnings.catch_warnings():

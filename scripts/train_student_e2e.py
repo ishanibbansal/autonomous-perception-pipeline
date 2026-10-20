@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.perception.models.teacher_bev import WaymoBEVDetector
-from src.perception.models.student_bev import StudentBEVDetector, se3_inverse
+from src.perception.models.student_bev import StudentBEVDetector
 from src.perception.losses.distill_loss import CrossModalDistillationLoss
 from src.perception.utils.dataset import WaymoTemporalDataset, temporal_collate_fn
 from src.perception.utils.target_encoder import BEVGridEncoder
@@ -52,6 +52,7 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                 break
             past_features = None
             past_extrinsics = None
+            past_pose = None
             
             for step in reversed(range(seq_length)):
                 step_key = f't_{step}'
@@ -60,18 +61,21 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                 cam = step_data['camera_images'].to(device, non_blocking=True)
                 intrin = step_data['intrinsics'].to(device, non_blocking=True)
                 extrin = step_data['extrinsics'].to(device, non_blocking=True)
-                extrin_inv = se3_inverse(extrin)
+                pose = step_data['pose'].to(device, non_blocking=True)
                 
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     s_out = student(
-                        cam, intrin, extrin_inv, 
+                        cam, intrin, extrin, 
                         past_features=past_features, 
                         current_extrinsics=extrin, 
-                        past_extrinsics=past_extrinsics
+                        past_extrinsics=past_extrinsics,
+                        current_pose=pose,
+                        past_pose=past_pose,
                     )
                 
                 past_features = s_out['bev_features']
                 past_extrinsics = extrin
+                past_pose = pose
                 
                 if step == 0:
                     val_lidar = step_data['lidar_points'].to(device, non_blocking=True)
@@ -86,7 +90,8 @@ def validate_temporal(student, teacher, dataloader, criterion, encoder, device, 
                     with torch.amp.autocast('cuda', dtype=torch.float16):
                         t_out = teacher(val_lidar, val_indices, cam, val_uvs)
                         t_feat = t_out.get('bev_features', None)
-                        if t_feat is not None: t_feat = torch.flip(t_feat, dims=[-1])
+                        if t_feat is not None and getattr(teacher, 'legacy_frame', True):
+                            t_feat = torch.flip(t_feat, dims=[-1])
 
                         v_loss, v_dict = criterion(
                             s_out, t_feat, 
@@ -139,7 +144,8 @@ def train_student_e2e(args):
     for param in teacher.parameters(): param.requires_grad = False
 
     # 2. Load Phase 2 Temporal Student
-    student = StudentBEVDetector(use_temporal=True).to(device)
+    student = StudentBEVDetector(use_temporal=True, legacy_frame=False, positive_dims=True).to(device)
+    print("Student frame: legacy_frame=False. Do not resume best_e2e_student_checkpoint.pt into this geometry.")
     print(f"Loading Phase 2 Temporal Backbone from {args.temporal_ckpt}...")
     s_checkpoint = torch.load(args.temporal_ckpt, map_location=device)
     student.load_state_dict(s_checkpoint['model_state_dict'], strict=True)
@@ -181,6 +187,7 @@ def train_student_e2e(args):
         for batch_idx, batch in enumerate(train_dataloader):
             past_features = None
             past_extrinsics = None
+            past_pose = None
             
             for step in reversed(range(args.seq_length)):
                 step_key = f't_{step}'
@@ -189,28 +196,33 @@ def train_student_e2e(args):
                 cam = step_data['camera_images'].to(device, non_blocking=True)
                 intrin = step_data['intrinsics'].to(device, non_blocking=True)
                 extrin = step_data['extrinsics'].to(device, non_blocking=True)
-                extrin_inv = se3_inverse(extrin)
+                pose = step_data['pose'].to(device, non_blocking=True)
                 
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     if step > 0:
                         with torch.no_grad():
                             s_out = student(
-                                cam, intrin, extrin_inv, 
+                                cam, intrin, extrin, 
                                 past_features=past_features, 
                                 current_extrinsics=extrin, 
-                                past_extrinsics=past_extrinsics
+                                past_extrinsics=past_extrinsics,
+                                current_pose=pose,
+                                past_pose=past_pose,
                             )
                     else:
                         s_out = student(
-                            cam, intrin, extrin_inv, 
+                            cam, intrin, extrin, 
                             past_features=past_features, 
                             current_extrinsics=extrin, 
-                            past_extrinsics=past_extrinsics
+                            past_extrinsics=past_extrinsics,
+                            current_pose=pose,
+                            past_pose=past_pose,
                         )
                 
                 # Cache for the next loop iteration (detached to prevent gradient graph retention)
                 past_features = s_out['bev_features'].detach()
                 past_extrinsics = extrin
+                past_pose = pose
                 
                 if step == 0:
                     lidar_points = step_data['lidar_points'].to(device, non_blocking=True)
@@ -225,9 +237,10 @@ def train_student_e2e(args):
                         with torch.no_grad():
                             t_out = teacher(lidar_points, batch_indices, cam, lidar_uvs)
                             t_feat = t_out.get('bev_features', None)
-                            if t_feat is not None: t_feat = torch.flip(t_feat, dims=[-1])
                             t_logits = t_out.get('bev_occupancy', None)
-                            if t_logits is not None: t_logits = torch.flip(t_logits, dims=[-1])
+                            if getattr(teacher, 'legacy_frame', True):
+                                if t_feat is not None: t_feat = torch.flip(t_feat, dims=[-1])
+                                if t_logits is not None: t_logits = torch.flip(t_logits, dims=[-1])
 
                         total_loss, loss_dict = criterion(
                             s_out, t_feat, ground_truth=targets_gpu['bev_occupancy'],
@@ -239,7 +252,7 @@ def train_student_e2e(args):
                     scaler.scale(loss).backward()
 
             # Clean up intermediate sequence tensors to free VRAM during gradient accumulation
-            del past_features, past_extrinsics, s_out
+            del past_features, past_extrinsics, past_pose, s_out
             
             effective_total_batches = min(len(train_dataloader), args.max_batches) if args.max_batches is not None else len(train_dataloader)
             if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == effective_total_batches:

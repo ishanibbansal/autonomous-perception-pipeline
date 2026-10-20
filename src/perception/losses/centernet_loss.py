@@ -51,32 +51,52 @@ class CombinedBEVLoss(nn.Module):
 class WaymoDetectionLoss(nn.Module):
     """
     Master Loss Wrapper: Accepts full prediction and target dictionaries.
+    Occupancy uses penalty-reduced CenterNet focal loss, normalized by positive
+    peak count. LiDAR sees the full grid, so the focal mask is all ones.
     """
-    def __init__(self):
+    def __init__(self, focal_alpha=2.0, focal_beta=4.0):
         super().__init__()
-        self.occupancy_loss = CombinedBEVLoss(focal_loss=BEVFocalLoss(alpha=0.25, gamma=2.0))
+        self.focal_alpha = focal_alpha
+        self.focal_beta = focal_beta
         self.regression_loss = nn.SmoothL1Loss(reduction='none')
 
-    def forward(self, predictions, targets):
-        # 1. Spatial Occupancy Loss
-        occ_loss = self.occupancy_loss(predictions['bev_occupancy'], targets['bev_occupancy'])
+    def centernet_focal_loss(self, preds, targets):
+        preds = torch.clamp(torch.sigmoid(preds), min=1e-4, max=1 - 1e-4)
+        pos_inds = targets.eq(1).float()
+        neg_inds = targets.lt(1).float()
+        neg_weights = torch.pow(1 - targets, self.focal_beta)
+        pos_loss = torch.log(preds) * torch.pow(1 - preds, self.focal_alpha) * pos_inds
+        neg_loss = torch.log(1 - preds) * torch.pow(preds, self.focal_alpha) * neg_weights * neg_inds
+        num_pos = torch.clamp(pos_inds.sum(), min=1.0)
+        return -(pos_loss.sum() + neg_loss.sum()) / num_pos
 
-        mask = targets['mask'] # (B, 1, 160, 160)
+    def forward(self, predictions, targets):
+        occupancy = targets['bev_occupancy']
+        loss_focal = self.centernet_focal_loss(predictions['bev_occupancy'], occupancy)
+
+        preds_prob = torch.sigmoid(predictions['bev_occupancy'])
+        intersection = (preds_prob * occupancy).sum()
+        cardinality = preds_prob.sum() + occupancy.sum()
+        loss_dice = 1.0 - (2.0 * intersection + 1.0) / (cardinality + 1.0)
+
+        mask = targets['mask']
         mask_sum = mask.sum() + 1e-6
         
-        # 2. Dimensions (L, W, H)
         dim_err = self.regression_loss(predictions['dimensions'], targets['dimensions'])
-        dim_loss = (dim_err * mask).sum() / mask_sum
+        loss_dim = (dim_err * mask).sum() / mask_sum
 
-        # 3. Orientation (Sin, Cos)
         ori_err = self.regression_loss(predictions['orientation'], targets['orientation'])
-        ori_loss = (ori_err * mask).sum() / mask_sum
+        loss_ori = (ori_err * mask).sum() / mask_sum
         
-        # 4. NEW: Sub-Pixel Center Offset (dx, dy)
         offset_err = self.regression_loss(predictions['offset'], targets['offset'])
-        offset_loss = (offset_err * mask).sum() / mask_sum
+        loss_offset = (offset_err * mask).sum() / mask_sum
 
-        # Final Weighted Fusion
-        total_loss = occ_loss + (2.0 * dim_loss) + (1.0 * ori_loss) + (1.0 * offset_loss)
-        
-        return total_loss
+        loss_total = loss_focal + (2.0 * loss_dice) + (2.0 * loss_dim) + loss_ori + loss_offset
+        return {
+            'loss_total': loss_total,
+            'loss_focal': loss_focal,
+            'loss_dice': loss_dice,
+            'loss_dim': loss_dim,
+            'loss_ori': loss_ori,
+            'loss_offset': loss_offset,
+        }

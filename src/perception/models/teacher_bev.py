@@ -33,12 +33,13 @@ class PointPillarEncoder(nn.Module):
     def __init__(self, max_points_per_pillar=32, max_pillars=10000, 
                  out_channels=64, bev_h=160, bev_w=160,
                  point_cloud_range=[0.0, -40.0, 0.3, 70.0, 40.0, 3.0],
-                 in_point_features=71): 
+                 in_point_features=71, legacy_frame=True): 
         
         super().__init__()
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.out_channels = out_channels
+        self.legacy_frame = legacy_frame
         self.pc_range = point_cloud_range
         self.x_min, self.y_min, self.z_min, self.x_max, self.y_max, self.z_max = self.pc_range
         
@@ -61,17 +62,28 @@ class PointPillarEncoder(nn.Module):
         points = points[keep]
         batch_indices = batch_indices[keep]
         
-        grid_col = torch.floor((points[:, 1] - self.y_min) / self.voxel_y).long()
-        grid_row = torch.floor((points[:, 0] - self.x_min) / self.voxel_x).long()
-        grid_row = (self.bev_h - 1) - grid_row
-        
-        grid_col = torch.clamp(grid_col, 0, self.bev_w - 1)
-        grid_row = torch.clamp(grid_row, 0, self.bev_h - 1)
-        
+        if self.legacy_frame:
+            # Saved teacher checkpoints scattered Y without the left/right invert.
+            grid_col = torch.floor((points[:, 1] - self.y_min) / self.voxel_y).long()
+            grid_row = torch.floor((points[:, 0] - self.x_min) / self.voxel_x).long()
+            grid_row = (self.bev_h - 1) - grid_row
+            grid_col = torch.clamp(grid_col, 0, self.bev_w - 1)
+            grid_row = torch.clamp(grid_row, 0, self.bev_h - 1)
+            pillar_center_y = (grid_col.float() * self.voxel_y) + self.y_min + (self.voxel_y / 2.0)
+            pillar_center_x = ((self.bev_h - 1 - grid_row.float()) * self.voxel_x) + self.x_min + (self.voxel_x / 2.0)
+        else:
+            # Col 0 = +Y, row 0 = +X. Drop the border clamp so edge returns are not piled onto one pixel.
+            grid_col = torch.floor((self.bev_w - 1) - (points[:, 1] - self.y_min) / self.voxel_y).long()
+            grid_row = torch.floor((self.bev_h - 1) - (points[:, 0] - self.x_min) / self.voxel_x).long()
+            valid = (grid_col >= 0) & (grid_col < self.bev_w) & (grid_row >= 0) & (grid_row < self.bev_h)
+            points = points[valid]
+            batch_indices = batch_indices[valid]
+            grid_col = grid_col[valid]
+            grid_row = grid_row[valid]
+            pillar_center_y = ((self.bev_w - 1.5 - grid_col.float()) * self.voxel_y) + self.y_min
+            pillar_center_x = ((self.bev_h - 1.5 - grid_row.float()) * self.voxel_x) + self.x_min
+
         pillar_indices = batch_indices * (self.bev_h * self.bev_w) + grid_row * self.bev_w + grid_col
-        
-        pillar_center_y = (grid_col.float() * self.voxel_y) + self.y_min + (self.voxel_y / 2.0)
-        pillar_center_x = ((self.bev_h - 1 - grid_row.float()) * self.voxel_x) + self.x_min + (self.voxel_x / 2.0)
         pillar_center_z = (self.z_max + self.z_min) / 2.0
         
         rel_x = points[:, 0] - pillar_center_x
@@ -94,8 +106,9 @@ class PointPillarEncoder(nn.Module):
 
 
 class BiFPNBEVDecoder(nn.Module):
-    def __init__(self, in_channels=64):
+    def __init__(self, in_channels=64, positive_dims=False):
         super().__init__()
+        self.positive_dims = positive_dims
         
         self.enc1 = nn.Sequential(nn.Conv2d(in_channels, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True))
         self.enc2 = nn.Sequential(nn.MaxPool2d(2), nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True))
@@ -160,26 +173,36 @@ class BiFPNBEVDecoder(nn.Module):
         fused = torch.cat([agg1, agg2, agg3], dim=1)  
         out = self.final_conv(fused)                  
         
+        dimensions = self.dim_head(out)
+        if self.positive_dims:
+            dimensions = F.softplus(dimensions)
         return {
             'bev_occupancy': self.occupancy_head(out),
-            'dimensions': self.dim_head(out),
+            'dimensions': dimensions,
             'orientation': self.ori_head(out),
             'offset': self.offset_head(out)
         }
 
 
 class WaymoBEVDetector(nn.Module):
-    def __init__(self):
+    def __init__(self, legacy_frame=True, positive_dims=False):
         super().__init__()
+        # Default keeps best_waymo_bev_checkpoint.pt on the frame it was trained in.
+        self.legacy_frame = legacy_frame
         self.camera_encoder = CameraFeatureExtractor(out_channels=64)
+        if legacy_frame:
+            point_cloud_range = [0.0, -40.0, 0.3, 70.0, 40.0, 3.0]
+        else:
+            point_cloud_range = [0.0, -40.0, -2.0, 70.0, 40.0, 4.0]
         
         self.point_pillar_encoder = PointPillarEncoder(
             out_channels=64, bev_h=160, bev_w=160,
-            point_cloud_range=[0.0, -40.0, 0.3, 70.0, 40.0, 3.0],
-            in_point_features=71
+            point_cloud_range=point_cloud_range,
+            in_point_features=71,
+            legacy_frame=legacy_frame,
         )
         
-        self.bev_head = BiFPNBEVDecoder(in_channels=64)
+        self.bev_head = BiFPNBEVDecoder(in_channels=64, positive_dims=positive_dims)
             
     def forward(self, lidar_points, batch_indices, camera_images, lidar_uvs):
         batch_size = camera_images.shape[0]
