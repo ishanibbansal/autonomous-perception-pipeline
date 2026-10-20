@@ -58,7 +58,10 @@ def visualize_teacher(args):
     model.eval()
 
     encoder = BEVGridEncoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160)
-    decoder = CenterNetDecoder(x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160, threshold=args.threshold)
+    decoder = CenterNetDecoder(
+        x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160,
+        threshold=args.threshold, flip_y=model.legacy_frame,
+    )
     
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -80,7 +83,9 @@ def visualize_teacher(args):
                 # Extract physical 3D boxes via NMS decoder
                 decoded_boxes = decoder.decode(predictions)[0]
 
-                occ_logits = torch.flip(predictions['bev_occupancy'], dims=[-1])
+                occ_logits = predictions['bev_occupancy']
+                if model.legacy_frame:
+                    occ_logits = torch.flip(occ_logits, dims=[-1])
                 occ_probs = torch.sigmoid(occ_logits)[0, 0].cpu().numpy()
 
             encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])

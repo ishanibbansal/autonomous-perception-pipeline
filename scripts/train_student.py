@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.perception.models.teacher_bev import WaymoBEVDetector
-from src.perception.models.student_bev import StudentBEVDetector, se3_inverse
+from src.perception.models.student_bev import StudentBEVDetector
 from src.perception.losses.distill_loss import CrossModalDistillationLoss
 from src.perception.utils.dataset import WaymoDataset, waymo_collate_fn
 from src.perception.utils.validate import validate_student
@@ -89,7 +89,10 @@ def train_student(args):
     for param in teacher.parameters():
         param.requires_grad = False
 
-    student = StudentBEVDetector().to(device)
+    # Canonical splat for a future student. The frozen teacher checkpoint stays legacy,
+    # so its feature flip below follows teacher.legacy_frame, not this flag.
+    student = StudentBEVDetector(legacy_frame=False, positive_dims=True).to(device)
+    print("Student frame: legacy_frame=False. Do not treat best_e2e_student_checkpoint.pt as a resume into this geometry.")
     
     # Load Teacher's head weights into Student, then keep the head unfrozen so it can adapt
     student.bev_head.load_state_dict(teacher.bev_head.state_dict())
@@ -151,7 +154,6 @@ def train_student(args):
             intrinsics = batch['intrinsics'].to(device, non_blocking=True)
             extrinsics = batch['extrinsics'].to(device, non_blocking=True)
             
-            extrinsics_inv = se3_inverse(extrinsics)
             depth_labels = batch['depth_labels'].to(device, non_blocking=True)
             
             encoded_targets = encoder.encode(batch['bboxes'], batch['num_valid_boxes'])
@@ -162,14 +164,14 @@ def train_student(args):
                     teacher_outputs = teacher(lidar_points, batch_indices, camera_images, lidar_uvs)
                     
                     teacher_features = teacher_outputs.get('bev_features', None)
-                    if teacher_features is not None:
-                        teacher_features = torch.flip(teacher_features, dims=[-1])
-                        
                     teacher_logits = teacher_outputs.get('bev_occupancy', None)
-                    if teacher_logits is not None:
-                        teacher_logits = torch.flip(teacher_logits, dims=[-1])
+                    if getattr(teacher, 'legacy_frame', True):
+                        if teacher_features is not None:
+                            teacher_features = torch.flip(teacher_features, dims=[-1])
+                        if teacher_logits is not None:
+                            teacher_logits = torch.flip(teacher_logits, dims=[-1])
 
-                student_outputs = student(camera_images, intrinsics, extrinsics_inv)
+                student_outputs = student(camera_images, intrinsics, extrinsics)
                 
                 total_loss, loss_dict = criterion(
                     student_outputs, 

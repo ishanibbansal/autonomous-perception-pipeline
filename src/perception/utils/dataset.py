@@ -200,6 +200,9 @@ class WaymoDataset(Dataset):
                 fused_lidar_uvs[valid_uv_mask, 0] = 1920.0 - fused_lidar_uvs[valid_uv_mask, 0]
                 intrinsics[0, 2] = 1920.0 - intrinsics[0, 2]
                 depth_label = np.ascontiguousarray(np.flip(depth_label, axis=1))
+                # Reflect camera-to-vehicle across vehicle Y so the flipped image stays consistent.
+                flip_y = np.diag([1.0, -1.0, 1.0, 1.0]).astype(np.float32)
+                extrinsics = flip_y @ extrinsics @ flip_y
 
         return {
             'timestamp': torch.tensor(current_frame.timestamp_micros, dtype=torch.int64),
@@ -302,6 +305,7 @@ class WaymoTemporalDataset(WaymoDataset):
             # 3. Extract Core Camera Inputs
             front_image = self._extract_front_image(frame)
             intrinsics, extrinsics = self._extract_camera_params(frame)
+            pose = np.reshape(np.array(frame.pose.transform), [4, 4]).astype(np.float32)
             
             # Convert NumPy image to Tensor early to apply augmentations
             img_tensor = torch.from_numpy(front_image)
@@ -356,6 +360,7 @@ class WaymoTemporalDataset(WaymoDataset):
                     'camera_image': img_tensor,       
                     'intrinsics': torch.from_numpy(intrinsics),          
                     'extrinsics': torch.from_numpy(extrinsics),
+                    'pose': torch.from_numpy(pose),
                     'depth_label': torch.from_numpy(depth_label),
                     'bboxes': torch.from_numpy(bboxes),
                     'num_valid_boxes': torch.tensor(valid_idx, dtype=torch.int32),
@@ -368,6 +373,7 @@ class WaymoTemporalDataset(WaymoDataset):
                     'camera_image': img_tensor,       
                     'intrinsics': torch.from_numpy(intrinsics),          
                     'extrinsics': torch.from_numpy(extrinsics),
+                    'pose': torch.from_numpy(pose),
                 }
                 
             sequence_data.append(step_data)
@@ -390,7 +396,8 @@ def temporal_collate_fn(batch):
         collated[step_key] = {
             'camera_images': torch.stack([x['camera_image'] for x in step_batch]),
             'intrinsics': torch.stack([x['intrinsics'] for x in step_batch]),
-            'extrinsics': torch.stack([x['extrinsics'] for x in step_batch])
+            'extrinsics': torch.stack([x['extrinsics'] for x in step_batch]),
+            'pose': torch.stack([x['pose'] for x in step_batch]),
         }
         
         # Only t_0 contains the ground truth targets

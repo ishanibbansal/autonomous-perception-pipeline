@@ -56,17 +56,15 @@ class BEVGridEncoder:
                 ctx_feat = self.grid_w - 1 - ((y - self.y_range[0]) / self.res_y)
                 cty_feat = self.grid_h - 1 - ((x - self.x_range[0]) / self.res_x)
                 
-                # 2. Get discrete integer grid indices
-                grid_cx = int(ctx_feat)
-                grid_cy = int(cty_feat)
+                # floor, not int(): negative boundary values must not truncate toward zero.
+                grid_cx = math.floor(ctx_feat)
+                grid_cy = math.floor(cty_feat)
+                if not (0 <= grid_cx < self.grid_w and 0 <= grid_cy < self.grid_h):
+                    continue
                 
-                # 3. Calculate fractional sub-pixel offset (The missing 0.0 to 1.0 remainder)
+                # Fractional remainder lives only on the center cell.
                 offset_x = ctx_feat - grid_cx
                 offset_y = cty_feat - grid_cy
-                
-                # Clamp boundaries safely
-                grid_cx = max(0, min(grid_cx, self.grid_w - 1))
-                grid_cy = max(0, min(grid_cy, self.grid_h - 1))
                 
                 radius_x = max(1.5, (length / self.res_x) / 2.0)
                 radius_y = max(1.5, (width / self.res_y) / 2.0)
@@ -80,18 +78,17 @@ class BEVGridEncoder:
                 x_min = max(0, grid_cx - radius)
                 x_max = min(self.grid_w, grid_cx + radius + 1)
                 
-                dim_grids[b, 0, y_min:y_max, x_min:x_max] = length
-                dim_grids[b, 1, y_min:y_max, x_min:x_max] = width
-                dim_grids[b, 2, y_min:y_max, x_min:x_max] = height
+                dim_grids[b, 0, grid_cy, grid_cx] = length
+                dim_grids[b, 1, grid_cy, grid_cx] = width
+                dim_grids[b, 2, grid_cy, grid_cx] = height
                 
-                ori_grids[b, 0, y_min:y_max, x_min:x_max] = math.sin(heading)
-                ori_grids[b, 1, y_min:y_max, x_min:x_max] = math.cos(heading)
+                ori_grids[b, 0, grid_cy, grid_cx] = math.sin(heading)
+                ori_grids[b, 1, grid_cy, grid_cx] = math.cos(heading)
                 
-                # --- NEW: Assign offset targets ---
-                offset_grids[b, 0, y_min:y_max, x_min:x_max] = offset_x
-                offset_grids[b, 1, y_min:y_max, x_min:x_max] = offset_y
+                offset_grids[b, 0, grid_cy, grid_cx] = offset_x
+                offset_grids[b, 1, grid_cy, grid_cx] = offset_y
                 
-                mask_grids[b, 0, y_min:y_max, x_min:x_max] = 1.0 
+                mask_grids[b, 0, grid_cy, grid_cx] = 1.0 
                 
         return {
             'bev_occupancy': torch.from_numpy(bev_grids),

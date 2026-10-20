@@ -31,14 +31,16 @@ def validate_model(model, dataloader, criterion, encoder, device):
             
             with torch.amp.autocast('cuda'):
                 predictions = model(lidar_points, batch_indices, camera_images, lidar_uvs)
-                loss = criterion(predictions, targets_gpu)
+                loss_dict = criterion(predictions, targets_gpu)
+                loss = loss_dict['loss_total']
             
             total_loss += loss.item()
             
             preds_prob = torch.sigmoid(predictions['bev_occupancy'])
             
-            # The Teacher's predictions are physically mirrored. Flip them to match Ground Truth alignment.
-            preds_prob = torch.flip(preds_prob, dims=[-1])
+            # Legacy teacher pillars are mirrored in Y. Canonical pillars already match the target grid.
+            if getattr(model, 'legacy_frame', True):
+                preds_prob = torch.flip(preds_prob, dims=[-1])
             
             preds_binary = (preds_prob > 0.4).float()
             targets_binary = (targets_gpu['bev_occupancy'] > 0.3).float()
@@ -87,7 +89,7 @@ def validate_student(student, teacher, dataloader, criterion, encoder, device):
                 t_out = teacher(val_lidar, val_indices, val_cam, val_uvs)
                 
                 t_feat = t_out.get('bev_features', None)
-                if t_feat is not None:
+                if t_feat is not None and getattr(teacher, 'legacy_frame', True):
                     t_feat = torch.flip(t_feat, dims=[-1])
 
                 s_out = student(val_cam, val_int, val_ext)

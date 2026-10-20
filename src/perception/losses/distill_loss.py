@@ -30,7 +30,7 @@ class CrossModalDistillationLoss(nn.Module):
             x = max(x, 1.0) 
             for j in range(bev_w):
                 y = 40.0 - (j / float(bev_w)) * 80.0
-                if abs(y / x) < 0.65: 
+                if abs(y / x) < 0.60: 
                     mask[0, 0, i, j] = 1.0
         return mask
 
