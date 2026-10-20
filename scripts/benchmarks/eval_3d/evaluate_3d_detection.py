@@ -130,6 +130,30 @@ def parse_args():
         default=os.path.join(os.path.dirname(__file__), 'results'),
         help='Output directory for evaluation results'
     )
+    flip_group = parser.add_mutually_exclusive_group()
+    flip_group.add_argument(
+        '--flip-y',
+        dest='flip_y',
+        action='store_true',
+        help='Horizontally un-mirror decoder heads (legacy teacher eval). Default: on.'
+    )
+    flip_group.add_argument(
+        '--no-flip-y',
+        dest='flip_y',
+        action='store_false',
+        help='Decode heads in the model frame. Use for the student, whose pillars are already inverted.'
+    )
+    parser.set_defaults(flip_y=True)
+    parser.add_argument(
+        '--zero-offset',
+        action='store_true',
+        help='Ignore predicted offsets and decode peaks at cell centers (legacy student probe).'
+    )
+    parser.add_argument(
+        '--raw-extrinsics',
+        action='store_true',
+        help='Pass raw Waymo extrinsics into LiftSplat instead of se3_inverse(extrinsics). Student only.'
+    )
     return parser.parse_args()
 
 
@@ -334,6 +358,38 @@ def evaluate_detection_ap(predictions_by_frame, ground_truths_by_frame, metric_t
     return ap, int(np.sum(true_positives)), total_gts
 
 
+def _fmt_stat(value):
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"
+
+
+def _summarize_box_dims(lengths, widths):
+    """Median / min / max of decoded length and width. None when no boxes."""
+    if not lengths:
+        return {
+            'count': 0,
+            'length_median': None,
+            'length_min': None,
+            'length_max': None,
+            'width_median': None,
+            'width_min': None,
+            'width_max': None,
+        }
+
+    length_arr = np.asarray(lengths, dtype=np.float64)
+    width_arr = np.asarray(widths, dtype=np.float64)
+    return {
+        'count': int(length_arr.size),
+        'length_median': float(np.median(length_arr)),
+        'length_min': float(length_arr.min()),
+        'length_max': float(length_arr.max()),
+        'width_median': float(np.median(width_arr)),
+        'width_min': float(width_arr.min()),
+        'width_max': float(width_arr.max()),
+    }
+
+
 def classify_box_dimension(length, width, height):
     """
     Dimension-based class prior classifier for CenterPoint / CenterNet outputs:
@@ -469,7 +525,13 @@ def main():
         bev_h=160,
         bev_w=160,
         threshold=args.score_thresh,
-        min_radius=args.min_radius
+        min_radius=args.min_radius,
+        flip_y=args.flip_y,
+        zero_offset=args.zero_offset,
+    )
+    print(
+        f"Decoder        : flip_y={args.flip_y} | zero_offset={args.zero_offset} | "
+        f"raw_extrinsics={args.raw_extrinsics}"
     )
 
     # 8. Accumulation Structures for Predictions & Ground Truths
@@ -477,6 +539,9 @@ def main():
     # Class ID 0 represents overall (class-agnostic across Vehicles, Pedestrians, Cyclists)
     preds_per_class = {c: defaultdict(list) for c in [0, 1, 2, 4]}
     gts_per_class = {c: defaultdict(list) for c in [0, 1, 2, 4]}
+    # dim_head on pre-Log-3.21 student checkpoints is expected to be init noise.
+    decoded_lengths = []
+    decoded_widths = []
 
     print("\nStarting evaluation inference loop...")
     eval_start_time = time.time()
@@ -520,11 +585,13 @@ def main():
                     cam = step_data['camera_images'].to(device, non_blocking=True)
                     intrin = step_data['intrinsics'].to(device, non_blocking=True)
                     extrin = step_data['extrinsics'].to(device, non_blocking=True)
-                    extrin_inv = se3_inverse(extrin)
+                    # Default matches train_student_e2e.py. --raw-extrinsics probes the
+                    # camera-to-vehicle convention used by LiftSplat.get_geometry.
+                    lift_extrin = extrin if args.raw_extrinsics else se3_inverse(extrin)
 
                     with torch.amp.autocast(device_type=device.type, dtype=torch.float16 if 'cuda' in str(device) else torch.bfloat16):
                         s_out = model(
-                            cam, intrin, extrin_inv,
+                            cam, intrin, lift_extrin,
                             past_features=past_features,
                             current_extrinsics=extrin,
                             past_extrinsics=past_extrinsics
@@ -549,10 +616,10 @@ def main():
                 cam = batch['camera_images'].to(device, non_blocking=True)
                 intrin = batch['intrinsics'].to(device, non_blocking=True)
                 extrin = batch['extrinsics'].to(device, non_blocking=True)
-                extrin_inv = se3_inverse(extrin)
+                lift_extrin = extrin if args.raw_extrinsics else se3_inverse(extrin)
 
                 with torch.amp.autocast(device_type=device.type, dtype=torch.float16 if 'cuda' in str(device) else torch.bfloat16):
-                    s_out = model(cam, intrin, extrin_inv)
+                    s_out = model(cam, intrin, lift_extrin)
 
                 pred_dict = {
                     'bev_occupancy': s_out['bev_occupancy'].float(),
@@ -599,6 +666,8 @@ def main():
                 # 2. Predicted boxes
                 preds = decoded_batch[b_idx]
                 for p in preds:
+                    decoded_lengths.append(float(p['length']))
+                    decoded_widths.append(float(p['width']))
                     pred_cls = classify_box_dimension(p['length'], p['width'], p['height'])
                     p_obj = dict(p)
                     p_obj['class_id'] = pred_cls
@@ -618,6 +687,31 @@ def main():
 
     total_eval_time = time.time() - eval_start_time
     print(f"\nInference complete in {total_eval_time:.2f}s ({evaluated_frames / total_eval_time:.1f} FPS). Computing AP metrics...")
+
+    dim_stats = _summarize_box_dims(decoded_lengths, decoded_widths)
+    print(
+        "\n[Dim Head Diagnostic] Class rows use L/W heuristics "
+        "(ped: L,W < 1.4; cyclist: L < 2.6 and W < 1.4; else vehicle). "
+        "Overall CD AP ignores dimensions."
+    )
+    print(
+        f"  decoded boxes: {dim_stats['count']} | "
+        f"length median={_fmt_stat(dim_stats['length_median'])} "
+        f"min={_fmt_stat(dim_stats['length_min'])} max={_fmt_stat(dim_stats['length_max'])} | "
+        f"width median={_fmt_stat(dim_stats['width_median'])} "
+        f"min={_fmt_stat(dim_stats['width_min'])} max={_fmt_stat(dim_stats['width_max'])}"
+    )
+    if dim_stats['count'] == 0:
+        print("  WARNING: no decoded boxes. Class rows and Overall CD are both empty.")
+    elif (
+        dim_stats['length_median'] is None
+        or not (3.0 <= dim_stats['length_median'] <= 6.0)
+        or not (1.4 <= dim_stats['width_median'] <= 2.5)
+    ):
+        print(
+            "  WARNING: median L/W is not a typical vehicle. "
+            "Treat Vehicle/Pedestrian/Cyclist rows as unreliable; use Overall CD AP."
+        )
 
     # 9. Compute AP and mAP Metrics
     metrics_summary = {}
@@ -690,6 +784,10 @@ def main():
             'fps': round(evaluated_frames / total_eval_time, 2),
             'score_threshold': args.score_thresh,
             'min_radius': args.min_radius,
+            'flip_y': args.flip_y,
+            'zero_offset': args.zero_offset,
+            'raw_extrinsics': args.raw_extrinsics,
+            'dimension_stats': dim_stats,
             'metrics': metrics_summary
         }
 

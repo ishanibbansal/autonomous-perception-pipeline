@@ -296,3 +296,31 @@ This file serves as a living technical journal for the project. It tracks active
   - **E2E 1-Batch Integration Test (`scripts/train_student_e2e.py --max-batches 1`):**
     - `Batch 000 | Total: 22.8430 (Det: 5.936, Reg: 4.817, Dim: 2.008, Ori: 0.704)`
     - Successfully validated the entire FP16 mixed precision autocast, gradient scaler unscaling, gradient clipping, optimizer step, and EMA state update on CUDA without graph retention or memory leaks.
+
+### Log 3.22: Legacy Checkpoint Decode Audit & Full-Val Student Localization
+* **Date:** October 20, 2026
+* **Branch:** `feature/zero-retrain-eval-probes`
+* **What changed:**
+  Scoring only. No weights were retrained, and no encoder, loss, or target-encoder math was changed. `CenterNetDecoder` gained `flip_y` (default `True`, so `predict_bev.py` is unchanged) and `zero_offset` (default `False`). `evaluate_3d_detection.py` gained `--flip-y` / `--no-flip-y`, `--zero-offset`, and `--raw-extrinsics`, plus a decoded length/width diagnostic. `--raw-extrinsics` only swaps the matrix passed into Lift-Splat. `current_extrinsics` / `past_extrinsics` stay raw, matching how `best_e2e_student_checkpoint.pt` was trained. JSON under `scripts/benchmarks/eval_3d/results/` is gitignored; numbers below were read from those local files.
+* **Why the probes were necessary:**
+  `CenterNetDecoder.decode()` unconditionally flipped every head on the width axis and negated `offset_x` and `sin_h`. That un-mirror existed because `PointPillarEncoder` inverts X and does not invert Y, so teacher pillars are mirrored relative to `BEVGridEncoder` (col 0 = +Y). The student does not have that bug: `LiftSplatViewTransformer.voxel_pooling` already inverts both axes (`159 - x_idx`, `159 - y_idx`). Running the student through the teacher decoder therefore places peaks on the wrong side of the road. A second mismatch sits on the camera matrix. Waymo `calib.extrinsic.transform` is already camera-to-vehicle, and `get_geometry` applies that matrix as `T_vehicle←camera`, but `train_student_e2e.py` trained this checkpoint on `se3_inverse(extrinsics)`.
+* **100-frame probes (val, `--score-thresh 0.05`, `--min-radius 1.2`):**
+  - Teacher `best_waymo_bev_checkpoint.pt`, `--flip-y`: Vehicle CD AP@4.0m **36.82%**, Overall CD AP@4.0m **31.56%**, Vehicle BEV AP@0.5 **14.11%** (2,062 vehicle GT / 2,433 overall GT).
+  - Same teacher, `--no-flip-y`: Vehicle CD AP@4.0m **12.16%**, Overall CD AP@4.0m **7.93%**. The legacy decoder flip is the correct decode for this teacher checkpoint.
+  - Student `best_e2e_student_checkpoint.pt`, `--no-flip-y`, inverted extrinsics: Vehicle CD AP@4.0m **57.33%**, Overall CD AP@4.0m **50.24%**, Overall BEV AP@0.5 **18.32%**.
+  - Same student, `--raw-extrinsics`: Vehicle CD AP@4.0m **28.52%**, Overall CD AP@4.0m **25.06%**. The saved student weights learned the inverted matrix, even though that inverse is the wrong geometric convention.
+  - `--zero-offset` on the winning student protocol: Vehicle CD AP@4.0m **57.15%**, Overall CD AP@4.0m **50.17%**. Cell-center decoding does not beat the predicted offset on this checkpoint.
+* **991-frame student result (winning protocol: `--no-flip-y`, `se3_inverse(extrinsics)`, `--score-thresh 0.05`, `--min-radius 1.2`):**
+  - 991 frames, 15,393 GT objects, 31,730 decoded boxes. Checkpoint: `best_e2e_student_checkpoint.pt`. Flags recorded in `scripts/benchmarks/eval_3d/results/student_e2e_full_val/metrics.json` (`flip_y=false`, `zero_offset=false`, `raw_extrinsics=false`).
+  - **Overall (class-agnostic, the honest row):** CD AP@0.5m **13.13%**, @1.0m **15.87%**, @2.0m **23.44%**, @4.0m **30.62%**. BEV AP@0.5 **10.97%**. 3D AP@0.5 **0.95%**.
+  - **Vehicle:** CD AP@0.5m **14.18%**, @1.0m **21.22%**, @2.0m **29.71%**, @4.0m **36.16%**. BEV AP@0.5 **13.00%**. 3D AP@0.5 **0.95%**. 11,126 vehicle GT.
+  - Pedestrian CD AP@4.0m **0.14%**. Cyclist **0.00%**. Those class rows are not a localization measurement. `classify_box_dimension` splits classes by predicted length/width, and the dim head is not a car: length median **3.920 m** (min **−0.089 m**, max **9.406 m**), width median **1.300 m** (min **−0.111 m**, max **3.000 m**). Width sits under the 1.4 m pedestrian cutoff, and negative extents still come out of `dim_head`. Center matching does not use those extents. The 0.95% 3D AP@0.5 is a box-size failure, not a center failure.
+* **What this does not say:**
+  Log 3.20's teacher Vehicle CD AP@4.0m of **20.84%** is a 991-frame number whose writeup does not record score threshold (the harness default then was 0.15) or an explicit flip flag. This student table used 0.05. The 100-frame teacher probe at the same 0.05 threshold is **36.82%** with the flip and **12.16%** without it. 36.16% student full-val does not beat 20.84%, and it is not the same experiment as the 100-frame teacher probe.
+* **Bugs found and left in the training code:**
+  1. `PointPillarEncoder` still inverts X only and clamps border pillars. `BEVGridEncoder` and student `voxel_pooling` invert both axes. Student pooling uses `(159 - floor((coord-min)/res))`, which is not the same index as `floor((159) - (coord-min)/res)`.
+  2. `BEVGridEncoder.encode` clamps out-of-range floored centers onto border pixels and copies the center-cell fractional offset, dimensions, heading, and regression mask across the whole Gaussian square.
+  3. `WaymoDetectionLoss` still uses mean-reduced focal loss over the full 160×160 grid. `train_teacher.py` and `validate.py` still expect a scalar from that loss.
+  4. Horizontal flip in `WaymoDataset.__getitem__` mirrors image, lidar Y, box Y, and principal point, and does not reflect the camera-to-vehicle extrinsic. The distillation FOV cone is `abs(y/x) < 0.65`; the dataset filter is `0.60`.
+  5. `TemporalBEVFusion.align_past_features` warps with camera extrinsics (`se3_inverse(current) @ past`) and an `affine_grid` whose X translation is normalized as if the 0–70 m grid were centered. It does not use `frame.pose`. `WaymoTemporalDataset` does not return pose.
+  6. Student trainers and `validate.py` still `torch.flip` teacher features/logits before distillation, and the three student trainers still pass `se3_inverse(extrinsics)` into Lift-Splat. `evaluate_3d_detection.py` still defaults to that inverse so this 991-frame number can be rerun. The ONNX input name `extrinsics_inv` was not renamed.

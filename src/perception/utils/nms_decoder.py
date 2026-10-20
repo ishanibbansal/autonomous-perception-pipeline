@@ -3,13 +3,28 @@ import torch.nn.functional as F
 import math
 
 class CenterNetDecoder:
-    def __init__(self, x_range=(0.0, 70.0), y_range=(-40.0, 40.0), bev_h=160, bev_w=160, threshold=0.35, min_radius=1.2):
+    def __init__(
+        self,
+        x_range=(0.0, 70.0),
+        y_range=(-40.0, 40.0),
+        bev_h=160,
+        bev_w=160,
+        threshold=0.35,
+        min_radius=1.2,
+        flip_y=True,
+        zero_offset=False,
+    ):
         self.x_range = x_range
         self.y_range = y_range
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.threshold = threshold
         self.min_radius = min_radius
+        # Default True keeps predict_bev.py's legacy teacher un-mirror.
+        # Student features are already in the BEVGridEncoder frame; pass False.
+        self.flip_y = flip_y
+        # Legacy student checkpoints were trained before offset supervision.
+        self.zero_offset = zero_offset
         self.res_x = (x_range[1] - x_range[0]) / bev_h
         self.res_y = (y_range[1] - y_range[0]) / bev_w
         
@@ -37,15 +52,29 @@ class CenterNetDecoder:
                 
         return keep
         
-    def decode(self, predictions):
+    def decode(self, predictions, flip_y=None, zero_offset=None):
         """
         Translates CenterNet tensor predictions into rigid physical bounding boxes.
+
+        flip_y / zero_offset override the constructor when not None so existing
+        call sites keep the historical un-mirror unless a probe opts out.
         """
-        occ_logits = torch.flip(predictions['bev_occupancy'], dims=[-1])
-        dim_preds = torch.flip(predictions['dimensions'], dims=[-1])
-        ori_preds = torch.flip(predictions['orientation'], dims=[-1])
-        off_preds = torch.flip(predictions['offset'], dims=[-1])
-        
+        if flip_y is None:
+            flip_y = self.flip_y
+        if zero_offset is None:
+            zero_offset = self.zero_offset
+
+        if flip_y:
+            occ_logits = torch.flip(predictions['bev_occupancy'], dims=[-1])
+            dim_preds = torch.flip(predictions['dimensions'], dims=[-1])
+            ori_preds = torch.flip(predictions['orientation'], dims=[-1])
+            off_preds = torch.flip(predictions['offset'], dims=[-1])
+        else:
+            occ_logits = predictions['bev_occupancy']
+            dim_preds = predictions['dimensions']
+            ori_preds = predictions['orientation']
+            off_preds = predictions['offset']
+
         heatmap = torch.sigmoid(occ_logits)
         
         # 1. 5x5 Max Pooling (Creates a local suppression zone)
@@ -64,9 +93,16 @@ class CenterNetDecoder:
                 grid_cy, grid_cx = peak[0].item(), peak[1].item()
                 score = heatmap[b, 0, grid_cy, grid_cx].item()
                 
-                # [FIX 1]: Negate offset_x because the grid was flipped horizontally
-                offset_x = -off_preds[b, 0, grid_cy, grid_cx].item()
-                offset_y = off_preds[b, 1, grid_cy, grid_cx].item()
+                if zero_offset:
+                    offset_x = 0.0
+                    offset_y = 0.0
+                elif flip_y:
+                    # Negate offset_x because the grid was flipped horizontally.
+                    offset_x = -off_preds[b, 0, grid_cy, grid_cx].item()
+                    offset_y = off_preds[b, 1, grid_cy, grid_cx].item()
+                else:
+                    offset_x = off_preds[b, 0, grid_cy, grid_cx].item()
+                    offset_y = off_preds[b, 1, grid_cy, grid_cx].item()
                 
                 c_x = grid_cx + offset_x
                 c_y = grid_cy + offset_y
@@ -78,8 +114,10 @@ class CenterNetDecoder:
                 width = dim_preds[b, 1, grid_cy, grid_cx].item()
                 height = dim_preds[b, 2, grid_cy, grid_cx].item()
                 
-                # [FIX 2]: Negate sin_h because the grid was flipped horizontally
-                sin_h = -ori_preds[b, 0, grid_cy, grid_cx].item()
+                # Negate sin_h only when the occupancy grid was mirrored.
+                sin_h = ori_preds[b, 0, grid_cy, grid_cx].item()
+                if flip_y:
+                    sin_h = -sin_h
                 cos_h = ori_preds[b, 1, grid_cy, grid_cx].item()
                 heading = math.atan2(sin_h, cos_h)
                 
