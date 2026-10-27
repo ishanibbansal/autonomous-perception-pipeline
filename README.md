@@ -1,24 +1,24 @@
-# Waymo BEV Perception Pipeline: Distillation, Edge Deployment, and Motion Planning
+# Waymo BEV Perception Pipeline: Distillation and Edge Deployment
 
 [![CI - Geometry & Math Verification](https://github.com/ishanibbansal/autonomous-perception-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/ishanibbansal/autonomous-perception-pipeline/actions/workflows/ci.yml)
 
-A complete autonomous vehicle R&D stack trained on the Waymo Open Dataset. This repository implements a full pipeline from raw sensor ingestion to trajectory generation. 
+A perception stack trained on the Waymo Open Dataset. This repository covers sensor ingestion, teacher-student distillation, BEV detection, evaluation, and a C++ TensorRT ROS 2 inference node. It does not include a tracker or a motion planner.
 
-It features a **Teacher-Student Knowledge Distillation** architecture transferring 3D geometric perception from a heavy multi-modal sensor fusion model (LiDAR + Camera) into a lightweight vision-only monocular model. The perception outputs are bridged via rigorous Non-Maximum Suppression (NMS) math into a distributed **ROS 2 Prediction and Planning** stack to track objects and generate collision-free trajectories.
+A **Teacher-Student Knowledge Distillation** setup transfers 3D geometric perception from a multi-modal teacher (LiDAR + camera) into a lightweight vision-only monocular student. A Sub-Pixel NMS decoder turns the student's occupancy heatmap into physical `[x, y, length, width, heading]` boxes.
 
 ## Features
 
 * **Multi-Modal Teacher Network:** Fuses historical LiDAR sweeps (`num_sweeps=3`) using a PointPillars encoder and a ResNet perspective camera backbone via a BiFPN Bird's-Eye View (BEV) decoder.
 * **Monocular Student Network (Curriculum Learning):** A lightweight, camera-only architecture trained to mimic the Teacher's intermediate semantic feature maps and dense occupancy grids within a 70m deep by 80m wide forward-facing spatial grid.
-* **Mathematical BEV-to-Physical Bridge:** Implements a custom Sub-Pixel NMS Decoder to translate continuous probability heatmaps and tensor plateaus into rigid, physical `[x, y, length, width, heading]` bounding boxes for robotic planners.
-* **Distributed ROS 2 Architecture (`rclpy` & `rclcpp`):** Decouples the machine learning pipeline from the robotics pipeline. Uses Python ROS 2 nodes for rapid trajectory and Kalman Filter R&D, while supporting a C++ TensorRT edge deployment pipeline for the monocular student (`student_bev_node`).
-* **Hardware-Optimized Training:** Designed to train dual deep neural networks simultaneously on hardware constrained to 6GB-8GB of VRAM (e.g., NVIDIA RTX 2060) utilizing strict gradient accumulation and optimized multiprocessing.
+* **Mathematical BEV-to-Physical Bridge:** A Sub-Pixel NMS decoder turns continuous probability heatmaps and tensor plateaus into rigid `[x, y, length, width, heading]` boxes.
+* **C++ TensorRT ROS 2 Node:** `student_bev_inference` (`bev_node`) subscribes to `/camera/image_raw` and publishes a BEV occupancy heatmap on `/perception/bev_heatmap`. Training and evaluation stay in Python.
+* **Hardware-Optimized Training:** Designed for 6GB-8GB of VRAM (e.g., NVIDIA RTX 2060) using gradient accumulation and detached temporal feature caches.
 
 ---
 
 ## Edge Deployment (C++ & TensorRT)
 
-The primary engineering constraint of this pipeline is real-time autonomous execution. Relying on Python/PyTorch for inference introduces unacceptable overhead for vehicle motion planning.
+Python/PyTorch inference is too slow for a real-time perception budget, so the deployed path is a C++ TensorRT node.
 
 To bridge this, the Student monocular model is deployed via a bare-metal C++ TensorRT ROS 2 package (`student_bev_inference`), validated to achieve full numerical and spatial parity with the PyTorch baseline:
 * **Memory Management:** Replaces Python's dynamic garbage collection with pre-allocated contiguous GPU/CPU memory pools for input and output tensors.
@@ -51,42 +51,37 @@ This project uses a distributed headless compute model:
 **WSL2 GPU Setup:**
 Ensure your WSL2 environment can access the host NVIDIA drivers by adding this to your `~/.bashrc`:
 
-    ```bash
-    export PATH=$PATH:/usr/lib/wsl/lib
-    ```
+```bash
+export PATH=$PATH:/usr/lib/wsl/lib
+```
 
 ---
 
 ## Directory Structure
-    ```text
-    ├── data/
-    │   └── raw/
-    │       ├── train/               # Waymo .tfrecord training files
-    │       └── val/                 # Waymo .tfrecord validation files
-    ├── docs/                        # Documentation and engineering logs
-    │   └── dev_log.md
-    ├── scripts/                     # Pipeline utility and training scripts
-    │   ├── compare_pipelines.py     # PyTorch vs. C++ TensorRT parity verification tool
-    │   ├── test_ros_node.py         # ROS 2 test publisher and heatmap evaluator
-    │   ├── extract_calib.py         # Camera intrinsic/extrinsic calibration extractor
-    │   ├── export_onnx.py           # Static ONNX graph exporter
-    │   ├── train_student.py         # Phase 1: Spatial Initialization
-    │   ├── train_student_temporal.py # Phase 2: Temporal Fusion
-    │   ├── train_student_e2e.py     # Phase 3: End-to-End Fine-Tuning
-    │   ├── predict_student.py       # Monocular Student BEV prediction visualizer
-    │   └── predict_bev.py           # NMS Bounding Box visualizer
-    ├── src/                         # Core architecture and ROS 2 workspace
-    │   ├── perception/
-    │   │   ├── models/              # Teacher, Student, and Loss architectures
-    │   │   └── utils/               # NMS Decoders, target encoding, and datasets
-    │   ├── prediction/              # [NEW] EKF Object Tracking
-    │   ├── planning/                # [NEW] Trajectory Generation (MPC / Pure Pursuit)
-    │   └── ros_nodes/               # ROS 2 Deployment Workspace
-    │       ├── student_bev_inference/ # C++ TensorRT Edge Node
-    │       └── perception_bridge/     # Python rclpy Teacher Output Node
-    ├── .gitignore                   # Git ignore file
-    └── README.md                    # Project documentation
-    ```
+
+```text
+├── .github/workflows/ci.yml       # CPU geometry and distillation-loss tests
+├── data/raw/{train,val}/         # Waymo .tfrecord files (gitignored, not shipped)
+├── docs/dev_log.md               # Engineering scratchpad, not a user guide
+├── scripts/
+│   ├── benchmarks/
+│   │   ├── eval_3d/             # 3D / BEV / center-distance evaluation
+│   │   └── latency_trt/         # C++ TensorRT latency profiler
+│   ├── train_student.py         # Phase 1: spatial initialization
+│   ├── train_student_temporal.py
+│   ├── train_student_e2e.py     # Phase 3: end-to-end fine-tuning
+│   ├── export_onnx.py
+│   ├── compare_pipelines.py     # PyTorch vs. C++ TensorRT parity
+│   └── test_ros_node.py
+├── src/perception/
+│   ├── models/                  # Teacher and student
+│   ├── losses/
+│   ├── utils/                   # NMS decoder, target encoder, dataset
+│   └── ros_nodes/student_bev_inference/  # C++ TensorRT ROS 2 node
+├── tests/                       # CPU geometry and distillation-loss tests
+├── requirements-ci.txt          # pytest / numpy / scipy for those tests
+└── requirements.txt            # Frozen ROS 2 machine dump; do not pip install
+```
 
 ---
 
@@ -106,12 +101,16 @@ Numbers below are logged results, not CI checks. Geometry unit tests in `tests/`
 
 ### Detection Accuracy (Waymo Open Dataset Val Split)
 
-Strict camera-only monocular detection from `best_e2e_student_checkpoint.pt` (Log 3.22). Winning protocol: `--no-flip-y`, `se3_inverse(extrinsics)`, `--score-thresh 0.05`, `--min-radius 1.2`. Center-distance (CD) matching does not use predicted box extents.
+Strict camera-only monocular detection from `best_e2e_student_checkpoint.pt` (Log 3.22). Winning protocol: `--no-flip-y`, `se3_inverse(extrinsics)`, `--score-thresh 0.05`, `--min-radius 1.2`.
+
+Center-distance is nuScenes-style Euclidean matching of object centers. It is not volumetric IoU, and it does not use predicted box extents. The same run's 3D AP@0.5 is 0.95% because the dimension head does not produce usable extents.
 
 | Metric | Result |
 | --- | --- |
-| Overall Composite Distance (CD@4.0m) | 30.62% |
-| Vehicle Composite Distance (CD@4.0m) | 36.16% |
+| Overall Center-Distance AP (CD@4.0m) | 30.62% |
+| Vehicle Center-Distance AP (CD@4.0m) | 36.16% |
+| Overall 3D AP@0.5 | 0.95% |
+| Vehicle 3D AP@0.5 | 0.95% |
 | Evaluated Frames | 991 frames (15,393 ground-truth objects) |
 | Evaluation split / notes | Strict camera-only monocular detection |
 
@@ -133,16 +132,33 @@ TensorRT `.engine` plans are hardware-architecture specific and compiled on-devi
 
 ## Installation
 
-1. **Clone the repository:**
+### Geometry tests (no dataset, no GPU, no ROS)
 
-        git clone https://github.com/ishanibbansal/autonomous-perception-pipeline.git
-        cd autonomous-perception-pipeline
+This is the only path that runs from a fresh clone.
 
-2. **Install Python Dependencies:**
-   Ensure you have PyTorch (with CUDA support) and TensorFlow (strictly for parsing `.tfrecord` files). 
+```bash
+git clone https://github.com/ishanibbansal/autonomous-perception-pipeline.git
+cd autonomous-perception-pipeline
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements-ci.txt
+PYTHONPATH=. pytest tests/test_canonical_frame.py tests/test_distill_loss.py -v
+```
 
-        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-        pip install tensorflow opencv-python matplotlib tensorboard onnx
+`torchvision` is required because `src/perception/models/student_bev.py` imports it at module load. The tests never download weights or run the network.
 
-3. **Install ROS 2 & TensorRT Dependencies:**
-   Ensure ROS 2 and TensorRT 11+ runtime headers and development libraries are installed.
+Do not `pip install -r requirements.txt`. That file is a freeze of a ROS 2 Humble machine, including `rclpy`, TensorFlow 2.11, and CUDA 11.8 wheels. It will not install in a normal virtualenv.
+
+### Training
+
+Training and full-val evaluation need the Waymo Open Dataset under `data/raw/{train,val}` and a CUDA GPU. Checkpoints and `.tfrecord` files are gitignored.
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install tensorflow opencv-python matplotlib tensorboard onnx
+```
+
+TensorFlow is only used to parse `.tfrecord` files.
+
+### ROS 2 and TensorRT
+
+The C++ node is `src/perception/ros_nodes/student_bev_inference`. It needs ROS 2 Humble (Ubuntu 22.04) and TensorRT 11 development libraries. `student_bev.engine` is compiled on the target GPU and is not in the repository; an engine built for another GPU will not load.
