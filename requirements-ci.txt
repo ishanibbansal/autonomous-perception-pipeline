@@ -1,0 +1,17 @@
+# CPU-only dependencies for geometry and distillation-loss unit tests.
+# Do not install requirements.txt here: that freeze includes ROS 2, TensorFlow,
+# and CUDA wheels that these tests do not need.
+#
+# Install CPU PyTorch first, then this file. A single --index-url pointing at
+# the PyTorch wheel index hides pytest, numpy, and scipy.
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-ci.txt
+#
+# torchvision is imported by src/perception/models/student_bev.py at module
+# load, which tests/test_canonical_frame.py reaches even though it never runs
+# the network.
+
+pytest>=7.0.0
+numpy>=1.21.0,<2.0.0
+scipy>=1.9.0

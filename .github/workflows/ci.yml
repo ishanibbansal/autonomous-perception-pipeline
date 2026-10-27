@@ -1,0 +1,33 @@
+name: CPU geometry tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  geometry:
+    name: pytest geometry and distillation loss
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install CPU PyTorch
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install test dependencies
+        run: pip install -r requirements-ci.txt
+
+      - name: Run geometry tests
+        env:
+          PYTHONPATH: .
+        run: pytest tests/test_canonical_frame.py tests/test_distill_loss.py -v

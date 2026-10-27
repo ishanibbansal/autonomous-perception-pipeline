@@ -1,5 +1,7 @@
 # Waymo BEV Perception Pipeline: Distillation, Edge Deployment, and Motion Planning
 
+[![CI - Geometry & Math Verification](https://github.com/ishanibbansal/autonomous-perception-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/ishanibbansal/autonomous-perception-pipeline/actions/workflows/ci.yml)
+
 A complete autonomous vehicle R&D stack trained on the Waymo Open Dataset. This repository implements a full pipeline from raw sensor ingestion to trajectory generation. 
 
 It features a **Teacher-Student Knowledge Distillation** architecture transferring 3D geometric perception from a heavy multi-modal sensor fusion model (LiDAR + Camera) into a lightweight vision-only monocular model. The perception outputs are bridged via rigorous Non-Maximum Suppression (NMS) math into a distributed **ROS 2 Prediction and Planning** stack to track objects and generate collision-free trajectories.
@@ -49,12 +51,14 @@ This project uses a distributed headless compute model:
 **WSL2 GPU Setup:**
 Ensure your WSL2 environment can access the host NVIDIA drivers by adding this to your `~/.bashrc`:
 
+    ```bash
     export PATH=$PATH:/usr/lib/wsl/lib
+    ```
 
 ---
 
 ## Directory Structure
-
+    ```text
     ├── data/
     │   └── raw/
     │       ├── train/               # Waymo .tfrecord training files
@@ -82,6 +86,7 @@ Ensure your WSL2 environment can access the host NVIDIA drivers by adding this t
     │       └── perception_bridge/     # Python rclpy Teacher Output Node
     ├── .gitignore                   # Git ignore file
     └── README.md                    # Project documentation
+    ```
 
 ---
 
@@ -92,6 +97,37 @@ This repository utilizes a Curriculum Learning approach, splitting the distillat
 *   **Phase 1: Spatial Initialization:** Trains the `LiftSplatViewTransformer` and spatial backbone on single frames to establish the core 2D-to-3D geometric mapping.
 *   **Phase 2: Temporal Fusion:** Freezes the spatial backbone and introduces a T=3 chronological sequence loop (t-2, t-1, t0) to track velocity and handle occlusions.
 *   **Phase 3: End-to-End Fine-Tuning:** Unfreezes the entire network architecture with micro learning rates (`1e-5`) to allow temporal loss gradients to optimize the ResNet camera feature extractor.
+
+---
+
+## Benchmarks & Performance
+
+Numbers below are logged results, not CI checks. Geometry unit tests in `tests/` run on CPU and do not require Waymo records, checkpoints, ROS 2, or a GPU. Full-val detection and TensorRT latency were measured locally; see `docs/dev_log.md` (Log 3.20 and Log 3.22) for the evaluation protocol.
+
+### Detection Accuracy (Waymo Open Dataset Val Split)
+
+Strict camera-only monocular detection from `best_e2e_student_checkpoint.pt` (Log 3.22). Winning protocol: `--no-flip-y`, `se3_inverse(extrinsics)`, `--score-thresh 0.05`, `--min-radius 1.2`. Center-distance (CD) matching does not use predicted box extents.
+
+| Metric | Result |
+| --- | --- |
+| Overall Composite Distance (CD@4.0m) | 30.62% |
+| Vehicle Composite Distance (CD@4.0m) | 36.16% |
+| Evaluated Frames | 991 frames (15,393 ground-truth objects) |
+| Evaluation split / notes | Strict camera-only monocular detection |
+
+### Edge Hardware Latency (RTX 2060)
+
+C++ TensorRT latency profiler in `scripts/benchmarks/latency_trt/`, recorded in Log 3.20 on an NVIDIA GeForce RTX 2060.
+
+| Metric | Result |
+| --- | --- |
+| Engine / Precision | TensorRT 11 (FP16) |
+| Mean Latency | 54.08 ms |
+| Throughput | 18.5 FPS |
+| P95 Latency | 54.32 ms |
+| VRAM Budget | < 6.0 GB VRAM allocation limit |
+
+TensorRT `.engine` plans are hardware-architecture specific and compiled on-device. See docs/dev_log.md for compilation profiles.
 
 ---
 
